@@ -5,6 +5,7 @@ export const StoreContext = createContext(null);
 
 const StoreContextProvider = (props) => {
     const url = import.meta.env.VITE_BACKEND_URL;
+    const [loading, setLoading] = useState(true);
     const [cartItems, setCartItems] = useState({});
     const [token, setToken] = useState('');
     const [food_list, setFoodList] = useState([]);
@@ -44,8 +45,15 @@ const StoreContextProvider = (props) => {
     }
 
     const fetchFoodList = async () => {
-        const response = await axios.get(url+'/api/food/list');
-        setFoodList(response.data.data);
+        try {
+            const response = await axios.get(url+'/api/food/list');
+            setFoodList(response.data.data);
+        } catch(error) {
+            console.error("Failed to fetch food list:", error);
+        } finally {
+            setLoading(false);
+        }
+        
     }
 
     const loadCartData = async (token) => {
@@ -68,6 +76,7 @@ const StoreContextProvider = (props) => {
         }
         loadData();
     }, []);
+    if (loading) return <div>Loading food items...</div>;
   return (
     <StoreContext.Provider value={contextvalue}>
         {props.children}
