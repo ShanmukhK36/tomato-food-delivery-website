@@ -4,7 +4,7 @@ import upload from '../middleware/multer.js';
 
 const foodRouter = express.Router();
 
-foodRouter.post('/add', upload.single('image'), addFood);
+foodRouter.post('/add', upload.fields([{name: 'image', maxCount: 1}]), addFood);
 foodRouter.get('/list', foodList);
 foodRouter.post('/remove', removeFood);
 

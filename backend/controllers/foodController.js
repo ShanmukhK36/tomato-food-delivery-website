@@ -3,11 +3,11 @@ import foodModel from "../models/foodModel.js";
 
 // add food items
 const addFood = async(req, res) => {
-    let image = req.file.image && req.file.image[0];
+    const image = req.files.image && req.files.image[0];
     let result = await cloudinary.uploader.upload(image.path, {
-        resource_type: 'image',
+      resource_type: 'image',
     });
-    let image_url = result.secure_url;
+    const image_url = result.secure_url;
     const food = new foodModel({
         name: req.body.name,
         description: req.body.description,
