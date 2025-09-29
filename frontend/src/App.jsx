@@ -9,6 +9,7 @@ import PlaceOrder from './pages/PlaceOrder'
 import Verify from './pages/Verify'
 import MyOrders from './pages/MyOrders'
 import SearchBar from './components/SearchBar'
+import ChatbotWidget from './components/ChatbotWidget'
 
 const App = () => {
   const [showLogin, setShowLogin] = useState(false);
@@ -26,6 +27,8 @@ const App = () => {
           <Route path='/myorders' element={<MyOrders />}/>
         </Routes>
       </div>
+      {/* Floating chat lives outside main container so it can be fixed-positioned */}
+      <ChatbotWidget />
       <Footer />
     </div>
   )

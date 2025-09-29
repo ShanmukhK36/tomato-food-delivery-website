@@ -7,6 +7,7 @@ import userRouter from './routes/userRoute.js';
 import 'dotenv/config';
 import cartRouter from './routes/cartRoute.js';
 import orderRouter from './routes/orderRoute.js';
+import chatRouter from './routes/chatRoute.js';
 
 // app config
 const app = express();
@@ -25,6 +26,8 @@ app.use('/api/food', foodRouter);
 app.use('/api/user', userRouter);
 app.use('/api/cart', cartRouter);
 app.use('/api/order', orderRouter);
+app.use(express.json({ limit: "10kb" }));
+app.use('/api/chat', chatRouter);
 
 app.get('/', (req, res) => {
     res.send('API working');
