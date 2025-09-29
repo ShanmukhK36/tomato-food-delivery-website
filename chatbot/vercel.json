@@ -1,9 +1,13 @@
 {
+  "version": 2,
   "functions": {
     "api/index.py": {
-      "runtime": "python3.11",
       "memory": 1024,
       "maxDuration": 10
     }
-  }
+  },
+  "rewrites": [
+    { "source": "/api/health", "destination": "/api/index/health" },
+    { "source": "/api/chat",   "destination": "/api/index/chat" }
+  ]
 }
