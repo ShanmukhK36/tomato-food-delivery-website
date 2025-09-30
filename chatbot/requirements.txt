@@ -1,4 +1,4 @@
-flask
+fastapi
 pydantic
 pymongo[srv]
 dnspython
