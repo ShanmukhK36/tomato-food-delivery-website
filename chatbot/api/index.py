@@ -1,2 +1,2 @@
 # Vercel will look for `app` here
-from main import app
+from chatbot.main import app
