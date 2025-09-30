@@ -4,3 +4,4 @@ pymongo[srv]
 dnspython
 openai>=1.0.0
 python-dotenv
+mem0

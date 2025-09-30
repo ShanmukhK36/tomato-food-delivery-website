@@ -1,9 +1,10 @@
 {
   "version": 2,
   "functions": {
-    "api/*.py": {
+    "api/index.py": {
       "maxDuration": 30,
-      "memory": 1024
+      "memory": 1024,
+      "runtime": "python3.11"
     }
   }
 }
