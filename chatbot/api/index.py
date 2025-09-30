@@ -1,4 +1,7 @@
 # /chatbot/api/index.py
 import os, sys
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))  # add parent dir
-from main import app as app  # FastAPI instance named "app"
+
+# Add parent folder (/chatbot) to import path so we can import main.py
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
+from main import app  # FastAPI instance named "app"
