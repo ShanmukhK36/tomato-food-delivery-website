@@ -34,6 +34,17 @@ try:
 except Exception:
     client = None
 
+if OPENAI_API_KEY:
+    try:
+        # set request timeout on the client (safer across SDK versions)
+        from openai import OpenAI
+        client = OpenAI(timeout=OPENAI_TIMEOUT)
+    except Exception as e:
+        log.exception("OpenAI client init failed: %s", e)
+        client = None
+else:
+    log.error("OPENAI_API_KEY not set; LLM replies will be disabled")
+
 try:
     mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000) if MONGO_URI else None
     db = mongo[DB_NAME] if mongo else None
@@ -459,7 +470,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             return ChatResp(reply="I’m temporarily offline. Popular dishes: " + ", ".join(popular[:10]) + ".")
         raise HTTPException(status_code=503, detail="Assistant temporarily unavailable")
 
-    # ---- Call OpenAI (no 'timeout=' here) ----
+    # ---- Call OpenAI (no 'timeout=' kwarg here) ----
     try:
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -478,7 +489,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             return ChatResp(reply="I’m having trouble reaching the assistant. Popular dishes: " + ", ".join(popular[:10]) + ".")
         raise HTTPException(status_code=502, detail="Chat service upstream error")
     except Exception as e:
-        # Catch-all so you never get a plain 500
+        # Catch-all to prevent raw 500s in production
         log.exception("openai unexpected req_id=%s err=%s", req_id, e)
         popular = get_popular_items()
         if popular:
