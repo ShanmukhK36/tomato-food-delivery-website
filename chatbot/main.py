@@ -412,9 +412,6 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
     if not safe_eq(x_service_auth, SHARED_SECRET):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    if client is None:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY missing on server")
-
     user_msg = trim_text(req.message, MAX_MSG_LEN)
     if not user_msg:
         raise HTTPException(status_code=400, detail="message is required")
@@ -422,29 +419,47 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
     user_id = req.userId or None
     req_id = getattr(request.state, "req_id", "n/a")
 
-    # Popularity questions: answer from DB only
+    # ---- Popularity questions: answer from DB, no LLM needed ----
     if is_popularity_query(user_msg):
         cat = category_from_query(user_msg)
         names = top_items_from_orders(limit=3, category=cat) or top_items_from_foods(limit=3, category=cat)
         if names:
-            return ChatResp(reply=(f"Our most-ordered {cat.rstrip('s')} right now: " if cat else "Top items customers are ordering: ") + ", ".join(names) + ".")
+            if cat:
+                return ChatResp(reply=f"Our most-ordered {cat.rstrip('s')} right now: " + ", ".join(names) + ".")
+            else:
+                return ChatResp(reply="Top items customers are ordering: " + ", ".join(names) + ".")
 
-    # Category-first answers (no LLM needed)
+    # ---- Category-first answers (no LLM needed) ----
     cat = category_from_query(user_msg)
     if cat:
         fetch_map = {
-            "sandwich": get_sandwich_names, "rolls": get_rolls_names, "salad": get_salad_names,
-            "desserts": get_desserts_names, "cake": get_cake_names, "pasta": get_pasta_names,
-            "noodles": get_noodles_names, "veg": get_veg_names,
+            "sandwich": get_sandwich_names,
+            "rolls":    get_rolls_names,
+            "salad":    get_salad_names,
+            "desserts": get_desserts_names,
+            "cake":     get_cake_names,
+            "pasta":    get_pasta_names,
+            "noodles":  get_noodles_names,
+            "veg":      get_veg_names,
         }
-        names = fetch_map.get(cat, lambda *_: [])(limit=20)
-        if names:
-            return ChatResp(reply=f"Our {cat.rstrip('s')} options include: " + ", ".join(names[:10]) + ".")
+        fetcher = fetch_map.get(cat)
+        if fetcher:
+            names = fetcher(limit=20)
+            if names:
+                return ChatResp(reply=f"Our {cat.rstrip('s')} options include: " + ", ".join(names[:10]) + ".")
 
-    # Build LLM context & call
+    # ---- Build LLM context ----
     db_context = build_context(user_msg, user_id)
     full_prompt = f"{db_context}\nCustomer: {user_msg}\nSupport Agent:"
 
+    # ---- If OpenAI client missing, return a graceful fallback instead of 500 ----
+    if client is None:
+        popular = top_items_from_orders(limit=10) or get_popular_items()
+        if popular:
+            return ChatResp(reply="I’m temporarily offline. Popular dishes: " + ", ".join(popular[:10]) + ".")
+        raise HTTPException(status_code=503, detail="Assistant temporarily unavailable")
+
+    # ---- Call OpenAI (no 'timeout=' here) ----
     try:
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -454,7 +469,6 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             ],
             temperature=0.3,
             max_tokens=OPENAI_MAX_TOKENS,
-            timeout=OPENAI_TIMEOUT,
         )
         answer = (completion.choices[0].message.content or "").strip()
     except (APIConnectionError, RateLimitError, APIStatusError) as e:
@@ -463,14 +477,15 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
         if popular:
             return ChatResp(reply="I’m having trouble reaching the assistant. Popular dishes: " + ", ".join(popular[:10]) + ".")
         raise HTTPException(status_code=502, detail="Chat service upstream error")
-    except Exception:
-        log.exception("openai unexpected req_id=%s", req_id)
+    except Exception as e:
+        # Catch-all so you never get a plain 500
+        log.exception("openai unexpected req_id=%s err=%s", req_id, e)
         popular = get_popular_items()
         if popular:
             return ChatResp(reply="I’m having trouble reaching the assistant. Popular dishes: " + ", ".join(popular[:10]) + ".")
         raise HTTPException(status_code=502, detail="Chat service upstream error")
 
-    # Persist memory (best-effort)
+    # ---- Persist memory (best-effort) ----
     if memory and user_id:
         try:
             memory.add(user_msg, user_id=user_id, metadata={"app_id": "tomato", "role": "user"})
