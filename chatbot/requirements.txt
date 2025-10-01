@@ -2,6 +2,7 @@ fastapi
 pydantic>=2
 starlette
 pymongo
+dnspython
 openai>=1.0.0
 python-dotenv
 uvicorn

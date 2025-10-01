@@ -12,33 +12,36 @@ from pymongo.errors import PyMongoError
 from openai import OpenAI, APIConnectionError, RateLimitError, APIStatusError
 from dotenv import load_dotenv
 
-from fastapi.routing import APIRoute
-
-@app.get("/__routes")
-def list_routes():
-    return [r.path for r in app.routes]
-
 # ---------------- Env & Logging ----------------
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tomatoai")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY not set")
-client = OpenAI()  # reads key from env
+# Environment (lazy init so import never crashes)
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_TIMEOUT   = float(os.getenv("OPENAI_TIMEOUT", "10"))
+SHARED_SECRET    = os.getenv("SHARED_SECRET", "dev-secret")
 
-MONGO_URI = os.getenv("MONGO_URI")
-DB_NAME = os.getenv("DB_NAME", "food-delivery")
-if not MONGO_URI:
-    raise RuntimeError("MONGO_URI not set")
-mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
-db = mongo[DB_NAME]
+MONGO_URI        = os.getenv("MONGO_URI")
+DB_NAME          = os.getenv("DB_NAME", "food-delivery")
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-SHARED_SECRET = os.getenv("SHARED_SECRET", "dev-secret")
+USE_MEMORY       = os.getenv("USE_MEMORY", "0") == "1"  # default off on Vercel
 
-USE_MEMORY = os.getenv("USE_MEMORY", "1") == "1"
+# Clients (optional if env missing)
+try:
+    client = OpenAI(timeout=OPENAI_TIMEOUT) if OPENAI_API_KEY else None
+except Exception:
+    client = None
+
+try:
+    mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000) if MONGO_URI else None
+    db = mongo[DB_NAME] if mongo else None
+except Exception:
+    mongo = None
+    db = None
+
+# Optional memory (only if explicitly enabled)
 memory = None
 if USE_MEMORY:
     try:
@@ -57,12 +60,11 @@ if USE_MEMORY:
         memory = None
 
 # ---------------- Settings ----------------
-MAX_MSG_LEN = int(os.getenv("MAX_MSG_LEN", "2000"))
-MAX_POPULAR = int(os.getenv("MAX_POPULAR", "5"))
-MAX_RECENT = int(os.getenv("MAX_RECENT", "5"))
-OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "10"))  # seconds
-OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "300"))
-POPULARITY_START = 50
+MAX_MSG_LEN        = int(os.getenv("MAX_MSG_LEN", "2000"))
+MAX_POPULAR        = int(os.getenv("MAX_POPULAR", "5"))
+MAX_RECENT         = int(os.getenv("MAX_RECENT", "5"))
+OPENAI_MAX_TOKENS  = int(os.getenv("OPENAI_MAX_TOKENS", "300"))
+POPULARITY_START   = 50
 
 # ---------------- Seed Data (normalized) ----------------
 STATIC_FOODS = [
@@ -110,6 +112,8 @@ STATIC_FOODS = [
 
 def bootstrap_foods_if_empty():
     """Upsert a small menu so DB answers work immediately."""
+    if not db:
+        return
     try:
         if db["foods"].estimated_document_count() >= 10:
             return
@@ -144,6 +148,8 @@ def take(iterable, n):
 
 # Case-insensitive exact category match
 def _names_for(cat: str, limit: int = 20) -> List[str]:
+    if not db:
+        return []
     try:
         cur = db["foods"].find(
             {"category": {"$regex": f"^{cat}$", "$options": "i"}},
@@ -155,6 +161,8 @@ def _names_for(cat: str, limit: int = 20) -> List[str]:
         return []
 
 def get_popular_items(limit=MAX_POPULAR) -> List[str]:
+    if not db:
+        return []
     try:
         cur = db["foods"].find({}, {"name": 1}).sort("orders", -1).limit(limit)
         return [doc.get("name") for doc in cur if doc.get("name")]
@@ -163,7 +171,7 @@ def get_popular_items(limit=MAX_POPULAR) -> List[str]:
         return []
 
 def get_user_recent_orders(user_id: Optional[str], limit=MAX_RECENT) -> List[str]:
-    if not user_id:
+    if not (db and user_id):
         return []
     try:
         cur = (
@@ -177,7 +185,7 @@ def get_user_recent_orders(user_id: Optional[str], limit=MAX_RECENT) -> List[str
         log.exception("get_user_recent_orders failed")
         return []
 
-# Category helpers (use the unified _names_for)
+# Category helpers
 def get_sandwich_names(limit=20): return _names_for("sandwich", limit)
 def get_rolls_names(limit=20):    return _names_for("rolls", limit)
 def get_salad_names(limit=20):    return _names_for("salad", limit)
@@ -194,17 +202,14 @@ SYNONYMS = {
     "desert": "desserts", "deserts": "desserts",
     "pure veg": "veg",
 }
-
 def category_from_query(text: str) -> Optional[str]:
     lower = text.lower()
-    # direct hits
     for raw in ("sandwich","roll","rolls","salad","dessert","desserts","cake","pasta","noodle","noodles","veg","pure veg"):
         if raw in lower:
             if raw in ("roll",): return "rolls"
             if raw in ("dessert",): return "desserts"
             if raw in ("pure veg",): return "veg"
             return raw.rstrip("s")
-    # synonyms
     for alias, canon in SYNONYMS.items():
         if alias in lower:
             return canon
@@ -218,17 +223,13 @@ def is_popularity_query(text: str) -> bool:
     return any(k in t for k in POPULAR_KEYWORDS)
 
 def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> List[str]:
-    """
-    Aggregates over orders.items to find most-ordered items.
-    Expected order doc shape: { items: [{name: <str>, qty: <int>}, ...], ... }
-    If category provided, look up foods to filter by category (case-insensitive).
-    """
+    if not db:
+        return []
     try:
         pipeline = [
             {"$unwind": "$items"},
             {"$addFields": {"qty": {"$ifNull": ["$items.qty", 1]}}},
         ]
-
         if category:
             cat_lower = category.lower()
             pipeline += [
@@ -241,7 +242,7 @@ def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> Lis
                                 "$match": {
                                     "$expr": {
                                         "$and": [
-                                            {"$eq": [{"$toLower": "$name"}, {"$toLower": "$$itemName"}]},
+                                            {"$eq": [{"$toLower": "$name"}, {"$toLower": "$$itemName"}]} ,
                                             {"$eq": [{"$toLower": "$category"}, cat_lower]},
                                         ]
                                     }
@@ -279,9 +280,8 @@ def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> Lis
         return []
 
 def top_items_from_foods(limit: int = 3, category: Optional[str] = None) -> List[str]:
-    """
-    Fallback popularity using foods.orders field.
-    """
+    if not db:
+        return []
     try:
         q = {}
         if category:
@@ -292,8 +292,9 @@ def top_items_from_foods(limit: int = 3, category: Optional[str] = None) -> List
         log.exception("top_items_from_foods failed (category=%s)", category)
         return []
 
-# Optional: keep foods.orders in sync when orders placed (call this in your order flow)
 def bump_food_orders(items: List[dict]):
+    if not db:
+        return
     try:
         for it in items or []:
             name = (it.get("name") or "").strip()
@@ -313,7 +314,7 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.3.0")
+app = FastAPI(title="Tomato Chatbot API", version="1.3.3")
 
 @app.on_event("startup")
 def _seed_on_startup():
@@ -327,13 +328,25 @@ async def add_request_id(request: Request, call_next):
     response.headers["x-request-id"] = req_id
     return response
 
+# Friendly root + route lister (helps debug paths on Vercel)
+@app.get("/")
+def root():
+    return {"ok": True, "service": "Tomato Chatbot API", "routes": ["/health", "/chat", "/__routes"]}
+
+from fastapi.routing import APIRoute
+@app.get("/__routes")
+def list_routes():
+    return [r.path for r in app.routes]
+
 @app.get("/health")
 def health():
-    db_ok = True
-    try:
-        mongo.admin.command("ping")
-    except Exception:
-        db_ok = False
+    db_ok = False
+    if mongo:
+        try:
+            mongo.admin.command("ping")
+            db_ok = True
+        except Exception:
+            db_ok = False
     return {
         "ok": True,
         "time": datetime.utcnow().isoformat() + "Z",
@@ -341,6 +354,7 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
+        "version": "1.3.3",
     }
 
 SYSTEM_PROMPT = (
@@ -368,23 +382,19 @@ def build_context(user_msg: str, user_id: Optional[str]) -> str:
     popular = take(get_popular_items(), MAX_POPULAR)
     recent = take(get_user_recent_orders(user_id), MAX_RECENT)
 
-    # include small curated lists so LLM has names to use
     sandwiches = take(get_sandwich_names(), MAX_POPULAR)
-    rolls = take(get_rolls_names(), MAX_POPULAR)
-    veg = take(get_veg_names(), MAX_POPULAR)
-    desserts = take(get_desserts_names(), MAX_POPULAR)
-    salad = take(get_salad_names(), MAX_POPULAR)
-    cake = take(get_cake_names(), MAX_POPULAR)
-    pasta = take(get_pasta_names(), MAX_POPULAR)
-    noodles = take(get_noodles_names(), MAX_POPULAR)
+    rolls      = take(get_rolls_names(), MAX_POPULAR)
+    veg        = take(get_veg_names(), MAX_POPULAR)
+    desserts   = take(get_desserts_names(), MAX_POPULAR)
+    salad      = take(get_salad_names(), MAX_POPULAR)
+    cake       = take(get_cake_names(), MAX_POPULAR)
+    pasta      = take(get_pasta_names(), MAX_POPULAR)
+    noodles    = take(get_noodles_names(), MAX_POPULAR)
 
     ctx_parts: List[str] = []
-    if mem_lines:
-        ctx_parts.append("Relevant past information:\n" + "\n".join(mem_lines))
-    if popular:
-        ctx_parts.append("Popular dishes: " + ", ".join(popular))
-    if recent:
-        ctx_parts.append("User recent orders: " + ", ".join(recent))
+    if mem_lines: ctx_parts.append("Relevant past information:\n" + "\n".join(mem_lines))
+    if popular:   ctx_parts.append("Popular dishes: " + ", ".join(popular))
+    if recent:    ctx_parts.append("User recent orders: " + ", ".join(recent))
     if sandwiches: ctx_parts.append("Sandwich options: " + ", ".join(sandwiches))
     if rolls:      ctx_parts.append("Rolls options: " + ", ".join(rolls))
     if salad:      ctx_parts.append("Salad options: " + ", ".join(salad))
@@ -394,15 +404,16 @@ def build_context(user_msg: str, user_id: Optional[str]) -> str:
     if noodles:    ctx_parts.append("Noodles options: " + ", ".join(noodles))
     if veg:        ctx_parts.append("Veg options: " + ", ".join(veg))
 
-    if not ctx_parts:
-        return ""
-    return "Database context:\n" + "\n".join(ctx_parts) + "\n"
+    return ("Database context:\n" + "\n".join(ctx_parts) + "\n") if ctx_parts else ""
 
 @app.post("/chat", response_model=ChatResp)
 async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: Request = None):
     # Auth
     if not safe_eq(x_service_auth, SHARED_SECRET):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if client is None:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY missing on server")
 
     user_msg = trim_text(req.message, MAX_MSG_LEN)
     if not user_msg:
@@ -411,39 +422,26 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
     user_id = req.userId or None
     req_id = getattr(request.state, "req_id", "n/a")
 
-    # ---- Popularity questions: answer from DB, no LLM needed ----
+    # Popularity questions: answer from DB only
     if is_popularity_query(user_msg):
         cat = category_from_query(user_msg)
-        names = top_items_from_orders(limit=3, category=cat)  # 1) real order history
-        if not names:
-            names = top_items_from_foods(limit=3, category=cat)  # 2) fallback to foods.orders
+        names = top_items_from_orders(limit=3, category=cat) or top_items_from_foods(limit=3, category=cat)
         if names:
-            if cat:
-                return ChatResp(reply=f"Our most-ordered {cat.rstrip('s')} right now: " + ", ".join(names) + ".")
-            else:
-                return ChatResp(reply="Top items customers are ordering: " + ", ".join(names) + ".")
-        # If still nothing, continue to normal flow
+            return ChatResp(reply=(f"Our most-ordered {cat.rstrip('s')} right now: " if cat else "Top items customers are ordering: ") + ", ".join(names) + ".")
 
-    # ---- Category-first answers (no LLM needed) ----
+    # Category-first answers (no LLM needed)
     cat = category_from_query(user_msg)
     if cat:
         fetch_map = {
-            "sandwich": get_sandwich_names,
-            "rolls":    get_rolls_names,
-            "salad":    get_salad_names,
-            "desserts": get_desserts_names,
-            "cake":     get_cake_names,
-            "pasta":    get_pasta_names,
-            "noodles":  get_noodles_names,
-            "veg":      get_veg_names,
+            "sandwich": get_sandwich_names, "rolls": get_rolls_names, "salad": get_salad_names,
+            "desserts": get_desserts_names, "cake": get_cake_names, "pasta": get_pasta_names,
+            "noodles": get_noodles_names, "veg": get_veg_names,
         }
-        fetcher = fetch_map.get(cat)
-        if fetcher:
-            names = fetcher(limit=20)
-            if names:
-                return ChatResp(reply=f"Our {cat.rstrip('s')} options include: " + ", ".join(names[:10]) + ".")
+        names = fetch_map.get(cat, lambda *_: [])(limit=20)
+        if names:
+            return ChatResp(reply=f"Our {cat.rstrip('s')} options include: " + ", ".join(names[:10]) + ".")
 
-    # ---- Build LLM context & call ----
+    # Build LLM context & call
     db_context = build_context(user_msg, user_id)
     full_prompt = f"{db_context}\nCustomer: {user_msg}\nSupport Agent:"
 
@@ -461,7 +459,6 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
         answer = (completion.choices[0].message.content or "").strip()
     except (APIConnectionError, RateLimitError, APIStatusError) as e:
         log.error("openai error req_id=%s type=%s msg=%s", req_id, type(e).__name__, str(e))
-        # graceful fallback: show popular dishes instead of 502
         popular = get_popular_items()
         if popular:
             return ChatResp(reply="I’m having trouble reaching the assistant. Popular dishes: " + ", ".join(popular[:10]) + ".")
@@ -481,11 +478,4 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
         except Exception:
             pass
 
-    # Final safety
-    if not isinstance(answer, str):
-        answer = ""
-
-    log.info("chat ok req_id=%s user=%s model=%s msg_len=%d ctx_len=%d",
-             req_id, user_id, OPENAI_MODEL, len(user_msg), len(db_context))
-
-    return ChatResp(reply=answer)
+    return ChatResp(reply=answer if isinstance(answer, str) else "")
