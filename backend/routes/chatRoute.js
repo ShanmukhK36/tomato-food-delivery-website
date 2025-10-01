@@ -7,7 +7,7 @@ import { randomUUID } from "crypto";
 
 const router = express.Router();
 
-const PY_CHAT_URL = (process.env.PY_CHAT_URL ?? "http://localhost:8000/chat").replace(/\/+$/, "");
+const PY_CHAT_URL = (process.env.PY_CHAT_URL ?? "http://localhost:8000/chat");
 const SHARED_SECRET = process.env.SHARED_SECRET ?? "dev-secret";
 const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS ?? 8000);
 const MAX_MESSAGE_LEN = Number(process.env.MAX_MESSAGE_LEN ?? 2000);
