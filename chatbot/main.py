@@ -1,4 +1,5 @@
 import os
+import re
 import hmac
 import logging
 from typing import Optional, List
@@ -75,6 +76,170 @@ MAX_POPULAR       = int(os.getenv("MAX_POPULAR", "5"))
 MAX_RECENT        = int(os.getenv("MAX_RECENT", "5"))
 OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "300"))
 POPULARITY_START  = 50
+
+# ---------------- Stripe error knowledge ----------------
+def _n(s: str) -> str:
+    """normalize key: lower + replace spaces/dashes with underscores"""
+    return (s or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+STRIPE_ERRORS = {
+    "types": {
+        "card_error": "A problem with the card (number, CVC, expiry, or bank declined the charge). Show a friendly message and ask for another payment method or to contact the bank.",
+        "invalid_request_error": "Your request to Stripe is malformed or missing params. Double-check IDs, amounts, currency, and required fields.",
+        "api_error": "Stripe had an internal error. Safe to retry after a brief delay.",
+        "rate_limit_error": "Too many requests too quickly. Back off and retry with exponential delay.",
+        "authentication_error": "Invalid or missing API key / account isn’t authorized. Verify the key (test vs live) and the account permissions.",
+        "permission_error": "The API key doesn’t have permission for that resource. Check Connect scopes / restricted keys.",
+        "idempotency_error": "Reused idempotency key with different params. Generate a fresh key for a new request.",
+        "api_connection_error": "Network problem reaching Stripe. Retry with backoff and verify TLS/network.",
+        "oauth_error": "OAuth / Connect authorization issue. Reconnect the account and verify the client settings.",
+    },
+    # 'code' (or older 'error.code')
+    "codes": {
+        # Request/param issues
+        "resource_missing": "The object ID you referenced doesn’t exist or isn’t accessible. Verify the ID and environment (test vs live).",
+        "parameter_missing": "A required parameter is missing. Add the missing field and retry.",
+        "parameter_invalid_integer": "Invalid numeric field. Provide a valid integer for amount/quantity.",
+        "amount_too_small": "Amount is below Stripe’s minimum for that currency. Increase the amount.",
+        "amount_too_large": "Amount exceeds allowed maximum. Lower the amount.",
+        "currency_mismatch": "You’re mixing currencies for related objects. Keep currencies consistent.",
+        "country_unsupported": "The country isn’t supported for this method. Use a supported country or method.",
+        "testmode_charges_only": "Using a test key in live mode (or vice versa). Switch to the correct key.",
+        "charge_already_captured": "The charge is already captured. Don’t capture again.",
+        "charge_already_refunded": "The charge is already refunded. Avoid duplicate refunds.",
+        "payment_intent_unexpected_state": "PaymentIntent is in a state that doesn’t allow the action. Fetch its latest status and follow the lifecycle.",
+        "setup_intent_unexpected_state": "SetupIntent can’t perform the action in its current status. Refresh and follow the required step.",
+        "authentication_required": "Strong customer authentication (3DS) is required. Present 3DS / next_action to the customer.",
+        # Card details
+        "invalid_number": "The card number is incorrect. Ask the customer to re-enter the card.",
+        "invalid_expiry_month": "Invalid expiry month.",
+        "invalid_expiry_year": "Invalid expiry year.",
+        "invalid_cvc": "CVC format is invalid.",
+        "incorrect_cvc": "CVC doesn’t match. Customer should re-enter CVC or use another card.",
+        "expired_card": "The card is expired. Use a different card.",
+        # Generic decline code included here as code in older flows
+        "card_declined": "The bank declined the charge. See decline_code for details or ask the customer to try another card.",
+        "processing_error": "An error occurred while processing the card. It’s usually transient—retry once, then try another method.",
+    },
+    # 'decline_code' (only when code == card_declined)
+    "decline_codes": {
+        "insufficient_funds": "The card has insufficient funds. Ask the customer to use another card or contact their bank.",
+        "lost_card": "The card was reported lost. The bank blocked it. Use a different card.",
+        "stolen_card": "The card was reported stolen. The bank blocked it. Use a different card.",
+        "do_not_honor": "The bank declined without a reason. Ask the customer to contact their bank or use another card.",
+        "generic_decline": "A generic decline from the bank. Try again later or use a different payment method.",
+        "pickup_card": "The bank requests to retain the card (severe flag). Use another card.",
+        "reenter_transaction": "Try entering the transaction again. If it repeats, use another card.",
+        "try_again_later": "Temporary issue at the bank. Try again later or another method.",
+        "fraudulent": "The bank suspects fraud. Use another card; advise the customer to contact their bank.",
+        "authentication_required": "3DS authentication required. Present 3D Secure to complete the payment.",
+        "incorrect_zip": "ZIP/postal code didn’t match. Ask the customer to confirm their billing ZIP.",
+        "incorrect_address": "Address check failed. Confirm the billing address.",
+        "incorrect_cvc": "CVC didn’t match. Re-enter CVC.",
+        "processor_declined": "The processor declined the charge. Use another card or contact bank.",
+    },
+    # PaymentIntent/SetupIntent helpful statuses (not errors but common confusion)
+    "intents": {
+        "requires_payment_method": "Payment failed or was canceled. Collect a new payment method and confirm again.",
+        "requires_confirmation": "You created/updated the intent. Now call confirm to continue.",
+        "requires_action": "Customer action (e.g., 3DS) required. Use next_action to complete authentication.",
+        "processing": "Stripe is processing the payment. Poll or wait for webhook to finalize.",
+        "succeeded": "Payment succeeded. You can fulfill the order.",
+        "canceled": "The intent was canceled. Create a new intent to retry.",
+    },
+}
+
+def is_stripe_query(text: str) -> bool:
+    t = (text or "").lower()
+    if "stripe" in t or "payment_intent" in t or "setup_intent" in t:
+        return True
+    if "decline_code" in t or "card_declined" in t:
+        return True
+    # if user pasted an error blob with these fields/words
+    for kw in ("error:", "code:", "type:", "payment_method", "3ds", "3d secure", "authentication_required"):
+        if kw in t:
+            return True
+    # any known key present
+    for key in list(STRIPE_ERRORS["types"].keys()) + list(STRIPE_ERRORS["codes"].keys()) + list(STRIPE_ERRORS["decline_codes"].keys()):
+        if key.replace("_", " ") in t or key in t:
+            return True
+    return False
+
+def explain_stripe_error(text: str) -> str:
+    """
+    Parse the user text and produce a concise, actionable explanation.
+    """
+    t = (text or "")
+    low = t.lower()
+
+    found_types = []
+    found_codes = []
+    found_declines = []
+    found_statuses = []
+
+    # brute-force match known keys
+    for k in STRIPE_ERRORS["types"]:
+        if k in low:
+            found_types.append(k)
+    for k in STRIPE_ERRORS["codes"]:
+        if k in low:
+            found_codes.append(k)
+    for k in STRIPE_ERRORS["decline_codes"]:
+        if k in low:
+            found_declines.append(k)
+    for k in STRIPE_ERRORS["intents"]:
+        if k in low:
+            found_statuses.append(k)
+
+    # also parse JSON-ish blobs like "decline_code": "insufficient_funds"
+    for m in re.finditer(r'(type|code|decline_code)\s*["\':]\s*["\']?([a-zA-Z0-9_\-]+)', t):
+        field = _n(m.group(1))
+        val = _n(m.group(2))
+        if field == "type" and val in STRIPE_ERRORS["types"] and val not in found_types:
+            found_types.append(val)
+        elif field == "code" and val in STRIPE_ERRORS["codes"] and val not in found_codes:
+            found_codes.append(val)
+        elif field == "decline_code" and val in STRIPE_ERRORS["decline_codes"] and val not in found_declines:
+            found_declines.append(val)
+
+    lines: List[str] = []
+
+    # Priority: card_declined + decline_code combo
+    if ("card_declined" in found_codes or "card_error" in found_types) and found_declines:
+        dc = found_declines[0]
+        lines.append(f"Stripe says **card_declined / {dc}** — {STRIPE_ERRORS['decline_codes'][dc]}")
+    # Specific code
+    if found_codes and not lines:
+        c = found_codes[0]
+        lines.append(f"Stripe **{c}** — {STRIPE_ERRORS['codes'][c]}")
+    # Type fallback
+    if found_types and not lines:
+        ty = found_types[0]
+        lines.append(f"Stripe **{ty}** — {STRIPE_ERRORS['types'][ty]}")
+    # Intent statuses (helpful hint if present)
+    if found_statuses:
+        st = found_statuses[0]
+        lines.append(f"Status **{st}** — {STRIPE_ERRORS['intents'][st]}")
+
+    # Nothing matched → give a compact playbook
+    if not lines:
+        lines = [
+            "I can help with Stripe errors. If you paste the JSON (type / code / decline_code), I’ll decode it.",
+            "Common cases:",
+            "• **card_declined** → bank rejected charge (see decline_code like insufficient_funds, do_not_honor).",
+            "• **authentication_required** → present 3DS (next_action).",
+            "• **invalid_request_error** → missing/wrong params; check IDs, currency, amounts.",
+            "• **rate_limit_error** → back off and retry.",
+        ]
+
+    # Next steps (generic + safe)
+    lines.append("Next steps: confirm the exact error fields, retry only idempotently, or collect a new payment method / contact bank if it’s a decline.")
+    # Keep response compact
+    reply = " ".join(lines)
+    # Trim to ~120-160 words to stay concise
+    if len(reply) > 900:
+        reply = reply[:900].rstrip() + "…"
+    return reply
 
 # ---------------- Seed Data (normalized) ----------------
 STATIC_FOODS = [
@@ -233,7 +398,7 @@ def is_popularity_query(text: str) -> bool:
     return any(k in t for k in POPULAR_KEYWORDS)
 
 def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> List[str]:
-    if db is None: 
+    if db is None:
         return []
     try:
         pipeline = [
@@ -290,7 +455,7 @@ def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> Lis
         return []
 
 def top_items_from_foods(limit: int = 3, category: Optional[str] = None) -> List[str]:
-    if db is None: 
+    if db is None:
         return []
     try:
         q = {}
@@ -303,7 +468,7 @@ def top_items_from_foods(limit: int = 3, category: Optional[str] = None) -> List
         return []
 
 def bump_food_orders(items: List[dict]):
-    if db is None: 
+    if db is None:
         return
     try:
         for it in items or []:
@@ -324,7 +489,7 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.3.5")
+app = FastAPI(title="Tomato Chatbot API", version="1.4.0")
 
 @app.on_event("startup")
 def _seed_on_startup():
@@ -396,7 +561,7 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.3.5",
+        "version": "1.4.0",
     }
 
 SYSTEM_PROMPT = (
@@ -462,7 +627,12 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
     user_id = req.userId or None
     req_id = getattr(request.state, "req_id", "n/a")
 
-    # Popularity questions (DB only)
+    # ---- Stripe errors branch (DB/LLM not needed) ----
+    if is_stripe_query(user_msg):
+        reply = explain_stripe_error(user_msg)
+        return ChatResp(reply=reply)
+
+    # ---- Popularity questions: answer from DB, no LLM needed ----
     if is_popularity_query(user_msg):
         cat = category_from_query(user_msg)
         names = top_items_from_orders(limit=3, category=cat) or top_items_from_foods(limit=3, category=cat)
@@ -472,7 +642,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             else:
                 return ChatResp(reply="Top items customers are ordering: " + ", ".join(names) + ".")
 
-    # Simple category lists (DB only)
+    # ---- Category-first answers (no LLM needed) ----
     cat = category_from_query(user_msg)
     if cat:
         fetch_map = {
@@ -491,18 +661,18 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             if names:
                 return ChatResp(reply=f"Our {cat.rstrip('s')} options include: " + ", ".join(names[:10]) + ".")
 
-    # Build LLM context
+    # ---- Build LLM context ----
     db_context = build_context(user_msg, user_id)
     full_prompt = f"{db_context}\nCustomer: {user_msg}\nSupport Agent:"
 
-    # Graceful fallback if LLM unavailable
+    # ---- Graceful fallback if LLM unavailable ----
     if client is None:
         popular = top_items_from_orders(limit=10) or get_popular_items()
         if popular:
             return ChatResp(reply="I’m temporarily offline. Popular dishes: " + ", ".join(popular[:10]) + ".")
         raise HTTPException(status_code=503, detail="Assistant temporarily unavailable")
 
-    # Call OpenAI (NO 'timeout=' kwarg here)
+    # ---- Call OpenAI (NO 'timeout=' kwarg here) ----
     try:
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -527,7 +697,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             return ChatResp(reply="I’m having trouble reaching the assistant. Popular dishes: " + ", ".join(popular[:10]) + ".")
         raise HTTPException(status_code=502, detail="Chat service upstream error")
 
-    # Persist memory (best-effort)
+    # ---- Persist memory (best-effort) ----
     if memory and user_id:
         try:
             memory.add(user_msg, user_id=user_id, metadata={"app_id": "tomato", "role": "user"})
