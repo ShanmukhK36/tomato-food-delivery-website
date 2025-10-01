@@ -1,9 +1,13 @@
 import express from "express";
 import { randomUUID } from "crypto";
 
+// If you're on Node < 18, install node-fetch@3 and uncomment:
+// import fetch from "node-fetch";
+// global.fetch = fetch;
+
 const router = express.Router();
 
-const PY_CHAT_URL = process.env.PY_CHAT_URL ?? "http://localhost:8000/chat";
+const PY_CHAT_URL = (process.env.PY_CHAT_URL ?? "http://localhost:8000/chat").replace(/\/+$/, "");
 const SHARED_SECRET = process.env.SHARED_SECRET ?? "dev-secret";
 const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS ?? 8000);
 const MAX_MESSAGE_LEN = Number(process.env.MAX_MESSAGE_LEN ?? 2000);
@@ -19,7 +23,6 @@ function validateBody(body) {
 }
 
 function logJSON(level, obj) {
-  // swap for pino/winston in prod
   console[level]?.(JSON.stringify(obj));
 }
 
@@ -49,12 +52,12 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-service-auth": SHARED_SECRET,
+      "x-service-auth": SHARED_SECRET, // must match Vercel SHARED_SECRET
+      "x-request-id": reqId,           // pass through for easier tracing
     },
     body: JSON.stringify({ message, userId }),
   });
 
-  // Minimal retry/backoff for transient upstream failures
   const tryOnce = async () => {
     const r = await fetchWithTimeout(PY_CHAT_URL, buildInit(), UPSTREAM_TIMEOUT_MS);
     return r;
@@ -68,16 +71,15 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     attempt++;
     try {
       upstreamRes = await tryOnce();
-      // Retry on transient server/network status
       if ([502, 503, 504].includes(upstreamRes.status) && attempt < 2) {
-        await new Promise(r => setTimeout(r, 250 * attempt));
+        await new Promise((r) => setTimeout(r, 250 * attempt));
         continue;
       }
       break;
     } catch (e) {
       lastErr = e;
       if (attempt >= 2) break;
-      await new Promise(r => setTimeout(r, 250 * attempt));
+      await new Promise((r) => setTimeout(r, 250 * attempt));
     }
   }
 
@@ -86,26 +88,20 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     return res.status(502).json({ error: "Chat service unavailable", requestId: reqId });
   }
 
-  // Map statuses: pass through 4xx, map 5xx to 502
-  const passthroughStatus =
-    upstreamRes.status >= 500 ? 502 : upstreamRes.status;
+  const passthroughStatus = upstreamRes.status >= 500 ? 502 : upstreamRes.status;
 
   let data;
   const isJson = upstreamRes.headers.get("content-type")?.includes("application/json");
-
   try {
     data = isJson ? await upstreamRes.json() : { error: "Invalid content-type from chatbot service" };
   } catch {
     data = { error: "Invalid JSON response from chatbot service" };
   }
 
-  // Optional sanity-check of shape
   if (passthroughStatus < 400 && (typeof data?.reply !== "string" || data.reply.length === 0)) {
-    // Normalize good-path shape to avoid client crashes
-    data = { reply: "" };
+    data = { reply: "" }; // normalize to avoid client crashes
   }
 
-  // Log (structured)
   logJSON("info", {
     reqId,
     route: "POST /api/chat",
