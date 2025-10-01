@@ -6,6 +6,7 @@ from datetime import datetime
 from itertools import islice
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
@@ -17,42 +18,40 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tomatoai")
 
-# Environment (lazy init so import never crashes)
-OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_TIMEOUT   = float(os.getenv("OPENAI_TIMEOUT", "10"))
-SHARED_SECRET    = os.getenv("SHARED_SECRET", "dev-secret")
+# Environment (lazy / tolerant so import never crashes)
+OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_TIMEOUT  = float(os.getenv("OPENAI_TIMEOUT", "10"))
+SHARED_SECRET   = os.getenv("SHARED_SECRET", "dev-secret")
 
-MONGO_URI        = os.getenv("MONGO_URI")
-DB_NAME          = os.getenv("DB_NAME", "food-delivery")
+MONGO_URI       = os.getenv("MONGO_URI")
+DB_NAME         = os.getenv("DB_NAME", "food-delivery")
 
-USE_MEMORY       = os.getenv("USE_MEMORY", "0") == "1"  # default off on Vercel
+USE_MEMORY      = os.getenv("USE_MEMORY", "0") == "1"  # default off on Vercel
 
-# Clients (optional if env missing)
-try:
-    client = OpenAI(timeout=OPENAI_TIMEOUT) if OPENAI_API_KEY else None
-except Exception:
-    client = None
-
+# OpenAI client (safe init; do NOT crash if missing/misconfigured)
+client = None
 if OPENAI_API_KEY:
     try:
-        # set request timeout on the client (safer across SDK versions)
-        from openai import OpenAI
-        client = OpenAI(timeout=OPENAI_TIMEOUT)
+        client = OpenAI(timeout=OPENAI_TIMEOUT)  # client-level timeout only
     except Exception as e:
         log.exception("OpenAI client init failed: %s", e)
         client = None
 else:
     log.error("OPENAI_API_KEY not set; LLM replies will be disabled")
 
+# Mongo (safe init)
+mongo = None
+db = None
 try:
-    mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000) if MONGO_URI else None
-    db = mongo[DB_NAME] if mongo else None
+    if MONGO_URI:
+        mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
+        db = mongo[DB_NAME]
 except Exception:
     mongo = None
     db = None
 
-# Optional memory (only if explicitly enabled)
+# Optional memory
 memory = None
 if USE_MEMORY:
     try:
@@ -71,54 +70,54 @@ if USE_MEMORY:
         memory = None
 
 # ---------------- Settings ----------------
-MAX_MSG_LEN        = int(os.getenv("MAX_MSG_LEN", "2000"))
-MAX_POPULAR        = int(os.getenv("MAX_POPULAR", "5"))
-MAX_RECENT         = int(os.getenv("MAX_RECENT", "5"))
-OPENAI_MAX_TOKENS  = int(os.getenv("OPENAI_MAX_TOKENS", "300"))
-POPULARITY_START   = 50
+MAX_MSG_LEN       = int(os.getenv("MAX_MSG_LEN", "2000"))
+MAX_POPULAR       = int(os.getenv("MAX_POPULAR", "5"))
+MAX_RECENT        = int(os.getenv("MAX_RECENT", "5"))
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "300"))
+POPULARITY_START  = 50
 
 # ---------------- Seed Data (normalized) ----------------
 STATIC_FOODS = [
     # Salad
-    {"name":"Greek salad","category":"salad","price":12},
-    {"name":"Veg salad","category":"salad","price":18},
-    {"name":"Clover Salad","category":"salad","price":16},
-    {"name":"Chicken Salad","category":"salad","price":24},
+    {"name": "Greek salad", "category": "salad", "price": 12},
+    {"name": "Veg salad", "category": "salad", "price": 18},
+    {"name": "Clover Salad", "category": "salad", "price": 16},
+    {"name": "Chicken Salad", "category": "salad", "price": 24},
     # Rolls
-    {"name":"Lasagna Rolls","category":"rolls","price":14},
-    {"name":"Peri Peri Rolls","category":"rolls","price":12},
-    {"name":"Chicken Rolls","category":"rolls","price":20},
-    {"name":"Veg Rolls","category":"rolls","price":15},
+    {"name": "Lasagna Rolls", "category": "rolls", "price": 14},
+    {"name": "Peri Peri Rolls", "category": "rolls", "price": 12},
+    {"name": "Chicken Rolls", "category": "rolls", "price": 20},
+    {"name": "Veg Rolls", "category": "rolls", "price": 15},
     # Desserts
-    {"name":"Ripple Ice Cream","category":"desserts","price":14},
-    {"name":"Fruit Ice Cream","category":"desserts","price":22},
-    {"name":"Jar Ice Cream","category":"desserts","price":10},
-    {"name":"Vanilla Ice Cream","category":"desserts","price":12},
+    {"name": "Ripple Ice Cream", "category": "desserts", "price": 14},
+    {"name": "Fruit Ice Cream", "category": "desserts", "price": 22},
+    {"name": "Jar Ice Cream", "category": "desserts", "price": 10},
+    {"name": "Vanilla Ice Cream", "category": "desserts", "price": 12},
     # Sandwich
-    {"name":"Chicken Sandwich","category":"sandwich","price":12},
-    {"name":"Vegan Sandwich","category":"sandwich","price":18},
-    {"name":"Grilled Sandwich","category":"sandwich","price":16},
-    {"name":"Bread Sandwich","category":"sandwich","price":24},
+    {"name": "Chicken Sandwich", "category": "sandwich", "price": 12},
+    {"name": "Vegan Sandwich", "category": "sandwich", "price": 18},
+    {"name": "Grilled Sandwich", "category": "sandwich", "price": 16},
+    {"name": "Bread Sandwich", "category": "sandwich", "price": 24},
     # Cake
-    {"name":"Cup Cake","category":"cake","price":14},
-    {"name":"Vegan Cake","category":"cake","price":12},
-    {"name":"Butterscotch Cake","category":"cake","price":20},
-    {"name":"Sliced Cake","category":"cake","price":15},
+    {"name": "Cup Cake", "category": "cake", "price": 14},
+    {"name": "Vegan Cake", "category": "cake", "price": 12},
+    {"name": "Butterscotch Cake", "category": "cake", "price": 20},
+    {"name": "Sliced Cake", "category": "cake", "price": 15},
     # Veg mains
-    {"name":"Garlic Mushroom","category":"veg","price":14},
-    {"name":"Fried Cauliflower","category":"veg","price":22},
-    {"name":"Mix Veg Pulao","category":"veg","price":10},
-    {"name":"Rice Zucchini","category":"veg","price":12},
+    {"name": "Garlic Mushroom", "category": "veg", "price": 14},
+    {"name": "Fried Cauliflower", "category": "veg", "price": 22},
+    {"name": "Mix Veg Pulao", "category": "veg", "price": 10},
+    {"name": "Rice Zucchini", "category": "veg", "price": 12},
     # Pasta
-    {"name":"Cheese Pasta","category":"pasta","price":12},
-    {"name":"Tomato Pasta","category":"pasta","price":18},
-    {"name":"Creamy Pasta","category":"pasta","price":16},
-    {"name":"Chicken Pasta","category":"pasta","price":24},
+    {"name": "Cheese Pasta", "category": "pasta", "price": 12},
+    {"name": "Tomato Pasta", "category": "pasta", "price": 18},
+    {"name": "Creamy Pasta", "category": "pasta", "price": 16},
+    {"name": "Chicken Pasta", "category": "pasta", "price": 24},
     # Noodles
-    {"name":"Butter Noodles","category":"noodles","price":14},
-    {"name":"Veg Noodles","category":"noodles","price":12},
-    {"name":"Somen Noodles","category":"noodles","price":20},
-    {"name":"Cooked Noodles","category":"noodles","price":15},
+    {"name": "Butter Noodles", "category": "noodles", "price": 14},
+    {"name": "Veg Noodles", "category": "noodles", "price": 12},
+    {"name": "Somen Noodles", "category": "noodles", "price": 20},
+    {"name": "Cooked Noodles", "category": "noodles", "price": 15},
 ]
 
 def bootstrap_foods_if_empty():
@@ -215,7 +214,7 @@ SYNONYMS = {
 }
 def category_from_query(text: str) -> Optional[str]:
     lower = text.lower()
-    for raw in ("sandwich","roll","rolls","salad","dessert","desserts","cake","pasta","noodle","noodles","veg","pure veg"):
+    for raw in ("sandwich", "roll", "rolls", "salad", "dessert", "desserts", "cake", "pasta", "noodle", "noodles", "veg", "pure veg"):
         if raw in lower:
             if raw in ("roll",): return "rolls"
             if raw in ("dessert",): return "desserts"
@@ -234,8 +233,7 @@ def is_popularity_query(text: str) -> bool:
     return any(k in t for k in POPULAR_KEYWORDS)
 
 def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> List[str]:
-    if not db:
-        return []
+    if not db: return []
     try:
         pipeline = [
             {"$unwind": "$items"},
@@ -249,17 +247,13 @@ def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> Lis
                         "from": "foods",
                         "let": {"itemName": "$items.name"},
                         "pipeline": [
-                            {
-                                "$match": {
-                                    "$expr": {
-                                        "$and": [
-                                            {"$eq": [{"$toLower": "$name"}, {"$toLower": "$$itemName"}]} ,
-                                            {"$eq": [{"$toLower": "$category"}, cat_lower]},
-                                        ]
-                                    }
-                                }
-                            },
-                            {"$project": {"_id": 0, "name": 1}}
+                            {"$match": {"$expr": {
+                                "$and": [
+                                    {"$eq": [{"$toLower": "$name"}, {"$toLower": "$$itemName"}]},
+                                    {"$eq": [{"$toLower": "$category"}, cat_lower]},
+                                ]
+                            }}},
+                            {"$project": {"_id": 0, "name": 1}},
                         ],
                         "as": "food"
                     }
@@ -291,8 +285,7 @@ def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> Lis
         return []
 
 def top_items_from_foods(limit: int = 3, category: Optional[str] = None) -> List[str]:
-    if not db:
-        return []
+    if not db: return []
     try:
         q = {}
         if category:
@@ -304,8 +297,7 @@ def top_items_from_foods(limit: int = 3, category: Optional[str] = None) -> List
         return []
 
 def bump_food_orders(items: List[dict]):
-    if not db:
-        return
+    if not db: return
     try:
         for it in items or []:
             name = (it.get("name") or "").strip()
@@ -325,29 +317,61 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.3.3")
+app = FastAPI(title="Tomato Chatbot API", version="1.3.5")
 
 @app.on_event("startup")
 def _seed_on_startup():
     bootstrap_foods_if_empty()
 
+# Middleware adds x-request-id and prevents raw 500s from leaking
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
     req_id = request.headers.get("x-request-id") or os.urandom(8).hex()
     request.state.req_id = req_id
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        log.exception("Unhandled crash req_id=%s path=%s", req_id, request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "detail": "internal_error", "type": type(exc).__name__, "message": str(exc)},
+            headers={"x-request-id": req_id},
+        )
     response.headers["x-request-id"] = req_id
     return response
 
-# Friendly root + route lister (helps debug paths on Vercel)
+# Friendly root + route lister
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Tomato Chatbot API", "routes": ["/health", "/chat", "/__routes"]}
+    return {"ok": True, "service": "Tomato Chatbot API", "routes": [r.path for r in app.routes]}
 
-from fastapi.routing import APIRoute
 @app.get("/__routes")
 def list_routes():
     return [r.path for r in app.routes]
+
+@app.get("/debug")
+def debug():
+    try:
+        import openai as _openai
+        openai_ver = getattr(_openai, "__version__", "unknown")
+    except Exception:
+        openai_ver = "unknown"
+    db_ok = False
+    if mongo:
+        try:
+            mongo.admin.command("ping")
+            db_ok = True
+        except Exception:
+            db_ok = False
+    return {
+        "ok": True,
+        "has_openai_key": bool(OPENAI_API_KEY),
+        "client_is_none": client is None,
+        "model": OPENAI_MODEL,
+        "db": DB_NAME,
+        "db_ok": db_ok,
+        "packages": {"openai": openai_ver},
+    }
 
 @app.get("/health")
 def health():
@@ -365,7 +389,7 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.3.3",
+        "version": "1.3.5",
     }
 
 SYSTEM_PROMPT = (
@@ -403,9 +427,9 @@ def build_context(user_msg: str, user_id: Optional[str]) -> str:
     noodles    = take(get_noodles_names(), MAX_POPULAR)
 
     ctx_parts: List[str] = []
-    if mem_lines: ctx_parts.append("Relevant past information:\n" + "\n".join(mem_lines))
-    if popular:   ctx_parts.append("Popular dishes: " + ", ".join(popular))
-    if recent:    ctx_parts.append("User recent orders: " + ", ".join(recent))
+    if mem_lines:  ctx_parts.append("Relevant past information:\n" + "\n".join(mem_lines))
+    if popular:    ctx_parts.append("Popular dishes: " + ", ".join(popular))
+    if recent:     ctx_parts.append("User recent orders: " + ", ".join(recent))
     if sandwiches: ctx_parts.append("Sandwich options: " + ", ".join(sandwiches))
     if rolls:      ctx_parts.append("Rolls options: " + ", ".join(rolls))
     if salad:      ctx_parts.append("Salad options: " + ", ".join(salad))
@@ -417,6 +441,7 @@ def build_context(user_msg: str, user_id: Optional[str]) -> str:
 
     return ("Database context:\n" + "\n".join(ctx_parts) + "\n") if ctx_parts else ""
 
+# ---------------- Chat ----------------
 @app.post("/chat", response_model=ChatResp)
 async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: Request = None):
     # Auth
@@ -430,7 +455,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
     user_id = req.userId or None
     req_id = getattr(request.state, "req_id", "n/a")
 
-    # ---- Popularity questions: answer from DB, no LLM needed ----
+    # Popularity questions (DB only)
     if is_popularity_query(user_msg):
         cat = category_from_query(user_msg)
         names = top_items_from_orders(limit=3, category=cat) or top_items_from_foods(limit=3, category=cat)
@@ -440,7 +465,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             else:
                 return ChatResp(reply="Top items customers are ordering: " + ", ".join(names) + ".")
 
-    # ---- Category-first answers (no LLM needed) ----
+    # Simple category lists (DB only)
     cat = category_from_query(user_msg)
     if cat:
         fetch_map = {
@@ -459,18 +484,18 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             if names:
                 return ChatResp(reply=f"Our {cat.rstrip('s')} options include: " + ", ".join(names[:10]) + ".")
 
-    # ---- Build LLM context ----
+    # Build LLM context
     db_context = build_context(user_msg, user_id)
     full_prompt = f"{db_context}\nCustomer: {user_msg}\nSupport Agent:"
 
-    # ---- If OpenAI client missing, return a graceful fallback instead of 500 ----
+    # Graceful fallback if LLM unavailable
     if client is None:
         popular = top_items_from_orders(limit=10) or get_popular_items()
         if popular:
             return ChatResp(reply="I’m temporarily offline. Popular dishes: " + ", ".join(popular[:10]) + ".")
         raise HTTPException(status_code=503, detail="Assistant temporarily unavailable")
 
-    # ---- Call OpenAI (no 'timeout=' kwarg here) ----
+    # Call OpenAI (NO 'timeout=' kwarg here)
     try:
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -489,14 +514,13 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             return ChatResp(reply="I’m having trouble reaching the assistant. Popular dishes: " + ", ".join(popular[:10]) + ".")
         raise HTTPException(status_code=502, detail="Chat service upstream error")
     except Exception as e:
-        # Catch-all to prevent raw 500s in production
         log.exception("openai unexpected req_id=%s err=%s", req_id, e)
         popular = get_popular_items()
         if popular:
             return ChatResp(reply="I’m having trouble reaching the assistant. Popular dishes: " + ", ".join(popular[:10]) + ".")
         raise HTTPException(status_code=502, detail="Chat service upstream error")
 
-    # ---- Persist memory (best-effort) ----
+    # Persist memory (best-effort)
     if memory and user_id:
         try:
             memory.add(user_msg, user_id=user_id, metadata={"app_id": "tomato", "role": "user"})
