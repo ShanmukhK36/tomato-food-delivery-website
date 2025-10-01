@@ -122,7 +122,7 @@ STATIC_FOODS = [
 
 def bootstrap_foods_if_empty():
     """Upsert a small menu so DB answers work immediately."""
-    if not db:
+    if db is None:
         return
     try:
         if db["foods"].estimated_document_count() >= 10:
@@ -158,7 +158,7 @@ def take(iterable, n):
 
 # Case-insensitive exact category match
 def _names_for(cat: str, limit: int = 20) -> List[str]:
-    if not db:
+    if db is None:
         return []
     try:
         cur = db["foods"].find(
@@ -171,7 +171,7 @@ def _names_for(cat: str, limit: int = 20) -> List[str]:
         return []
 
 def get_popular_items(limit=MAX_POPULAR) -> List[str]:
-    if not db:
+    if db is None:
         return []
     try:
         cur = db["foods"].find({}, {"name": 1}).sort("orders", -1).limit(limit)
@@ -181,7 +181,7 @@ def get_popular_items(limit=MAX_POPULAR) -> List[str]:
         return []
 
 def get_user_recent_orders(user_id: Optional[str], limit=MAX_RECENT) -> List[str]:
-    if not (db and user_id):
+    if db is None or not user_id:
         return []
     try:
         cur = (
@@ -233,7 +233,8 @@ def is_popularity_query(text: str) -> bool:
     return any(k in t for k in POPULAR_KEYWORDS)
 
 def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> List[str]:
-    if not db: return []
+    if db is None: 
+        return []
     try:
         pipeline = [
             {"$unwind": "$items"},
@@ -247,12 +248,16 @@ def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> Lis
                         "from": "foods",
                         "let": {"itemName": "$items.name"},
                         "pipeline": [
-                            {"$match": {"$expr": {
-                                "$and": [
-                                    {"$eq": [{"$toLower": "$name"}, {"$toLower": "$$itemName"}]},
-                                    {"$eq": [{"$toLower": "$category"}, cat_lower]},
-                                ]
-                            }}},
+                            {
+                                "$match": {
+                                    "$expr": {
+                                        "$and": [
+                                            {"$eq": [{"$toLower": "$name"}, {"$toLower": "$$itemName"}]},
+                                            {"$eq": [{"$toLower": "$category"}, cat_lower]},
+                                        ]
+                                    }
+                                }
+                            },
                             {"$project": {"_id": 0, "name": 1}},
                         ],
                         "as": "food"
@@ -285,7 +290,8 @@ def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> Lis
         return []
 
 def top_items_from_foods(limit: int = 3, category: Optional[str] = None) -> List[str]:
-    if not db: return []
+    if db is None: 
+        return []
     try:
         q = {}
         if category:
@@ -297,7 +303,8 @@ def top_items_from_foods(limit: int = 3, category: Optional[str] = None) -> List
         return []
 
 def bump_food_orders(items: List[dict]):
-    if not db: return
+    if db is None: 
+        return
     try:
         for it in items or []:
             name = (it.get("name") or "").strip()
@@ -357,7 +364,7 @@ def debug():
     except Exception:
         openai_ver = "unknown"
     db_ok = False
-    if mongo:
+    if mongo is not None:
         try:
             mongo.admin.command("ping")
             db_ok = True
@@ -376,7 +383,7 @@ def debug():
 @app.get("/health")
 def health():
     db_ok = False
-    if mongo:
+    if mongo is not None:
         try:
             mongo.admin.command("ping")
             db_ok = True
