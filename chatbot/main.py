@@ -12,6 +12,12 @@ from pymongo.errors import PyMongoError
 from openai import OpenAI, APIConnectionError, RateLimitError, APIStatusError
 from dotenv import load_dotenv
 
+from fastapi.routing import APIRoute
+
+@app.get("/__routes")
+def list_routes():
+    return [r.path for r in app.routes]
+
 # ---------------- Env & Logging ----------------
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
