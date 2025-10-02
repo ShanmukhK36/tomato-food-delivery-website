@@ -1,16 +1,13 @@
 import express from "express";
 import { randomUUID } from "crypto";
 
-// If you're on Node < 18, install node-fetch@3 and uncomment:
-// import fetch from "node-fetch";
-// global.fetch = fetch;
-
 const router = express.Router();
 
-const PY_CHAT_URL = (process.env.PY_CHAT_URL ?? "http://localhost:8000/chat");
+const PY_CHAT_URL = process.env.PY_CHAT_URL ?? "http://localhost:8000/chat";
 const SHARED_SECRET = process.env.SHARED_SECRET ?? "dev-secret";
 const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS ?? 8000);
 const MAX_MESSAGE_LEN = Number(process.env.MAX_MESSAGE_LEN ?? 2000);
+const MAX_RETRIES = Number(process.env.UPSTREAM_RETRIES ?? 2); // total attempts
 
 // Simple schema (no deps)
 function validateBody(body) {
@@ -23,12 +20,12 @@ function validateBody(body) {
 }
 
 function logJSON(level, obj) {
-  console[level]?.(JSON.stringify(obj));
+  (console[level] || console.log)(JSON.stringify(obj));
 }
 
 async function fetchWithTimeout(url, init, timeoutMs) {
   const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(new Error("upstream timeout")), timeoutMs);
+  const t = setTimeout(() => ac.abort(), timeoutMs);
   try {
     return await fetch(url, { ...init, signal: ac.signal });
   } finally {
@@ -52,44 +49,50 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-service-auth": SHARED_SECRET, // must match Vercel SHARED_SECRET
-      "x-request-id": reqId,           // pass through for easier tracing
+      "x-service-auth": SHARED_SECRET, // must match Python SHARED_SECRET
+      "x-request-id": reqId,           // pass through for tracing
     },
     body: JSON.stringify({ message, userId }),
   });
 
   const tryOnce = async () => {
-    const r = await fetchWithTimeout(PY_CHAT_URL, buildInit(), UPSTREAM_TIMEOUT_MS);
-    return r;
+    return fetchWithTimeout(PY_CHAT_URL, buildInit(), UPSTREAM_TIMEOUT_MS);
   };
 
   let upstreamRes;
   let attempt = 0;
   let lastErr;
 
-  while (attempt < 2) {
+  while (attempt < MAX_RETRIES) {
     attempt++;
     try {
       upstreamRes = await tryOnce();
-      if ([502, 503, 504].includes(upstreamRes.status) && attempt < 2) {
+      // Retry only on upstream server errors
+      if ([502, 503, 504].includes(upstreamRes.status) && attempt < MAX_RETRIES) {
         await new Promise((r) => setTimeout(r, 250 * attempt));
         continue;
       }
       break;
     } catch (e) {
       lastErr = e;
-      if (attempt >= 2) break;
+      if (attempt >= MAX_RETRIES) break;
       await new Promise((r) => setTimeout(r, 250 * attempt));
     }
   }
 
   if (!upstreamRes) {
-    logJSON("error", { reqId, msg: "no upstream response", error: String(lastErr) });
+    logJSON("error", { reqId, route: "/api/chat", msg: "no upstream response", error: String(lastErr) });
     return res.status(502).json({ error: "Chat service unavailable", requestId: reqId });
   }
 
+  // Map 5xx to 502 so we don't leak internal upstream codes
   const passthroughStatus = upstreamRes.status >= 500 ? 502 : upstreamRes.status;
 
+  // Capture upstream headers
+  const upstreamAnswerSource = upstreamRes.headers.get("x-answer-source") || undefined;
+  const upstreamReqId = upstreamRes.headers.get("x-request-id") || reqId;
+
+  // Parse JSON safely
   let data;
   const isJson = upstreamRes.headers.get("content-type")?.includes("application/json");
   try {
@@ -98,9 +101,22 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     data = { error: "Invalid JSON response from chatbot service" };
   }
 
+  // Normalize successful-but-empty replies
   if (passthroughStatus < 400 && (typeof data?.reply !== "string" || data.reply.length === 0)) {
-    data = { reply: "" }; // normalize to avoid client crashes
+    data = { reply: "" };
   }
+
+  // Surface answer source in header and body (non-breaking)
+  if (upstreamAnswerSource) {
+    res.setHeader("X-Answer-Source", upstreamAnswerSource);
+    if (data && typeof data === "object" && data.answerSource == null) {
+      data.answerSource = upstreamAnswerSource;
+    }
+  }
+
+  // Echo tracing id back
+  res.setHeader("X-Request-Id", upstreamReqId);
+  res.setHeader("Cache-Control", "no-store");
 
   logJSON("info", {
     reqId,
@@ -108,9 +124,11 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     upstreamStatus: upstreamRes.status,
     mappedStatus: passthroughStatus,
     len: String(message).length,
+    attempts: attempt,
+    answerSource: upstreamAnswerSource ?? null,
   });
 
-  return res.status(passthroughStatus).json({ ...data, requestId: reqId });
+  return res.status(passthroughStatus).json({ ...data, requestId: upstreamReqId });
 });
 
 export default router;
