@@ -27,7 +27,6 @@ const ChatbotWidget = () => {
   const userId = useMemo(() => localStorage.getItem("userId") || "guest", []);
   const controllerRef = useRef(null);
   const inputRef = useRef(null);
-  const logRef = useRef(null);
   const endRef = useRef(null);
 
   // Persist messages per user
@@ -53,7 +52,6 @@ const ChatbotWidget = () => {
     const text = input.trim();
     if (!text || loading) return;
 
-    // Abort any in-flight request
     controllerRef.current?.abort?.();
     const ac = new AbortController();
     controllerRef.current = ac;
@@ -72,41 +70,26 @@ const ChatbotWidget = () => {
           signal: ac.signal,
         });
 
-        // Pull debug headers if present
-        const hdrAnswerSource = res.headers.get("X-Answer-Source") || undefined;
-        const hdrReqId = res.headers.get("X-Request-Id") || undefined;
-
         if (!res.ok) {
           let msg = `HTTP ${res.status}`;
-          let body;
           try {
-            body = await res.json();
-            if (body?.error) msg = body.error;
+            const err = await res.json();
+            if (err?.error) msg = err.error;
           } catch {}
-          const shownId = body?.requestId || hdrReqId;
-          if (shownId) msg += ` · id=${shownId}`;
           throw new Error(msg);
         }
 
-        const data = await res.json(); // { reply, requestId?, answerSource? }
-        const answerSource = data?.answerSource || hdrAnswerSource;
-        const requestId = data?.requestId || hdrReqId;
-
+        const data = await res.json(); // { reply }
         const botMsg = {
           id: uid(),
           role: "assistant",
           content: typeof data.reply === "string" ? data.reply : "...",
           ts: Date.now(),
-          meta: {
-            source: answerSource || null,
-            requestId: requestId || null,
-          },
         };
         setMessages((m) => [...m, botMsg]);
       } catch (err) {
-        if (ac.signal.aborted) return; // user sent a new message / closed widget
+        if (ac.signal.aborted) return;
         if (attempt < 2) {
-          // simple backoff
           await new Promise((r) => setTimeout(r, 400 * attempt));
           return tryFetch(attempt + 1);
         }
@@ -133,8 +116,6 @@ const ChatbotWidget = () => {
   const retry = (payload) => {
     if (!payload?.text) return;
     setInput(payload.text);
-    // Auto-send on retry? Uncomment:
-    // setTimeout(() => sendMessage(), 0);
   };
 
   const onKeyDown = (e) => {
@@ -143,17 +124,6 @@ const ChatbotWidget = () => {
       sendMessage();
     }
     if (e.key === "Escape") setOpen(false);
-  };
-
-  const MetaChips = ({ meta, error }) => {
-    if (error) return null;
-    if (!meta?.source && !meta?.requestId) return null;
-    return (
-      <span className="mt-1 block text-[10px] opacity-70">
-        {meta?.source ? <span className="mr-1">src:{meta.source}</span> : null}
-        {meta?.requestId ? <span>id:{meta.requestId}</span> : null}
-      </span>
-    );
   };
 
   return (
@@ -189,9 +159,8 @@ const ChatbotWidget = () => {
             </button>
           </div>
 
-          {/* Messages (aria-live for SRs) */}
+          {/* Messages */}
           <div
-            ref={logRef}
             className="flex-1 overflow-y-auto px-3 py-2 space-y-2"
             role="log"
             aria-live="polite"
@@ -230,10 +199,6 @@ const ChatbotWidget = () => {
                       </>
                     )}
                   </span>
-                  {/* tiny debug chips for assistant messages */}
-                  {m.role === "assistant" && (
-                    <MetaChips meta={m.meta} error={m.error} />
-                  )}
                 </div>
               </div>
             ))}
