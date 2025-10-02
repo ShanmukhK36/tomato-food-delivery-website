@@ -6,7 +6,7 @@ from typing import Optional, List
 from datetime import datetime
 from itertools import islice
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
@@ -19,10 +19,12 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tomatoai")
 
-# Environment (lazy / tolerant so import never crashes)
+# Environment (tolerant so import never crashes)
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT  = float(os.getenv("OPENAI_TIMEOUT", "10"))
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "300"))
+
 SHARED_SECRET   = os.getenv("SHARED_SECRET", "dev-secret")
 
 MONGO_URI       = os.getenv("MONGO_URI")
@@ -30,11 +32,14 @@ DB_NAME         = os.getenv("DB_NAME", "food-delivery")
 
 USE_MEMORY      = os.getenv("USE_MEMORY", "0") == "1"  # default off on Vercel
 
+# New: allow forcing the LLM to compose final text even for rule-based branches
+FORCE_LLM       = os.getenv("FORCE_LLM", "0") == "1"
+
 # OpenAI client (safe init; do NOT crash if missing/misconfigured)
 client = None
 if OPENAI_API_KEY:
     try:
-        client = OpenAI(timeout=OPENAI_TIMEOUT)  # client-level timeout only
+        client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT)  # explicit api_key
     except Exception as e:
         log.exception("OpenAI client init failed: %s", e)
         client = None
@@ -74,7 +79,6 @@ if USE_MEMORY:
 MAX_MSG_LEN       = int(os.getenv("MAX_MSG_LEN", "2000"))
 MAX_POPULAR       = int(os.getenv("MAX_POPULAR", "5"))
 MAX_RECENT        = int(os.getenv("MAX_RECENT", "5"))
-OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "300"))
 POPULARITY_START  = 50
 
 # ---------------- Stripe error knowledge ----------------
@@ -94,9 +98,7 @@ STRIPE_ERRORS = {
         "api_connection_error": "Network problem reaching Stripe. Retry with backoff and verify TLS/network.",
         "oauth_error": "OAuth / Connect authorization issue. Reconnect the account and verify the client settings.",
     },
-    # 'code' (or older 'error.code')
     "codes": {
-        # Request/param issues
         "resource_missing": "The object ID you referenced doesn’t exist or isn’t accessible. Verify the ID and environment (test vs live).",
         "parameter_missing": "A required parameter is missing. Add the missing field and retry.",
         "parameter_invalid_integer": "Invalid numeric field. Provide a valid integer for amount/quantity.",
@@ -110,24 +112,21 @@ STRIPE_ERRORS = {
         "payment_intent_unexpected_state": "PaymentIntent is in a state that doesn’t allow the action. Fetch its latest status and follow the lifecycle.",
         "setup_intent_unexpected_state": "SetupIntent can’t perform the action in its current status. Refresh and follow the required step.",
         "authentication_required": "Strong customer authentication (3DS) is required. Present 3DS / next_action to the customer.",
-        # Card details
         "invalid_number": "The card number is incorrect. Ask the customer to re-enter the card.",
         "invalid_expiry_month": "Invalid expiry month.",
         "invalid_expiry_year": "Invalid expiry year.",
         "invalid_cvc": "CVC format is invalid.",
         "incorrect_cvc": "CVC doesn’t match. Customer should re-enter CVC or use another card.",
         "expired_card": "The card is expired. Use a different card.",
-        # Generic decline code included here as code in older flows
         "card_declined": "The bank declined the charge. See decline_code for details or ask the customer to try another card.",
         "processing_error": "An error occurred while processing the card. It’s usually transient—retry once, then try another method.",
     },
-    # 'decline_code' (only when code == card_declined)
     "decline_codes": {
         "insufficient_funds": "The card has insufficient funds. Ask the customer to use another card or contact their bank.",
         "lost_card": "The card was reported lost. The bank blocked it. Use a different card.",
         "stolen_card": "The card was reported stolen. The bank blocked it. Use a different card.",
         "do_not_honor": "The bank declined without a reason. Ask the customer to contact their bank or use another card.",
-        "generic_decline": "A generic decline from the bank. Try again later or use a different payment method.",
+        "generic_decline": "A generic decline from the bank. Try again later or use a different method.",
         "pickup_card": "The bank requests to retain the card (severe flag). Use another card.",
         "reenter_transaction": "Try entering the transaction again. If it repeats, use another card.",
         "try_again_later": "Temporary issue at the bank. Try again later or another method.",
@@ -138,7 +137,6 @@ STRIPE_ERRORS = {
         "incorrect_cvc": "CVC didn’t match. Re-enter CVC.",
         "processor_declined": "The processor declined the charge. Use another card or contact bank.",
     },
-    # PaymentIntent/SetupIntent helpful statuses (not errors but common confusion)
     "intents": {
         "requires_payment_method": "Payment failed or was canceled. Collect a new payment method and confirm again.",
         "requires_confirmation": "You created/updated the intent. Now call confirm to continue.",
@@ -155,20 +153,15 @@ def is_stripe_query(text: str) -> bool:
         return True
     if "decline_code" in t or "card_declined" in t:
         return True
-    # if user pasted an error blob with these fields/words
     for kw in ("error:", "code:", "type:", "payment_method", "3ds", "3d secure", "authentication_required"):
         if kw in t:
             return True
-    # any known key present
     for key in list(STRIPE_ERRORS["types"].keys()) + list(STRIPE_ERRORS["codes"].keys()) + list(STRIPE_ERRORS["decline_codes"].keys()):
         if key.replace("_", " ") in t or key in t:
             return True
     return False
 
 def explain_stripe_error(text: str) -> str:
-    """
-    Parse the user text and produce a concise, actionable explanation.
-    """
     t = (text or "")
     low = t.lower()
 
@@ -177,7 +170,6 @@ def explain_stripe_error(text: str) -> str:
     found_declines = []
     found_statuses = []
 
-    # brute-force match known keys
     for k in STRIPE_ERRORS["types"]:
         if k in low:
             found_types.append(k)
@@ -191,7 +183,6 @@ def explain_stripe_error(text: str) -> str:
         if k in low:
             found_statuses.append(k)
 
-    # also parse JSON-ish blobs like "decline_code": "insufficient_funds"
     for m in re.finditer(r'(type|code|decline_code)\s*["\':]\s*["\']?([a-zA-Z0-9_\-]+)', t):
         field = _n(m.group(1))
         val = _n(m.group(2))
@@ -204,24 +195,19 @@ def explain_stripe_error(text: str) -> str:
 
     lines: List[str] = []
 
-    # Priority: card_declined + decline_code combo
     if ("card_declined" in found_codes or "card_error" in found_types) and found_declines:
         dc = found_declines[0]
         lines.append(f"Stripe says **card_declined / {dc}** — {STRIPE_ERRORS['decline_codes'][dc]}")
-    # Specific code
     if found_codes and not lines:
         c = found_codes[0]
         lines.append(f"Stripe **{c}** — {STRIPE_ERRORS['codes'][c]}")
-    # Type fallback
     if found_types and not lines:
         ty = found_types[0]
         lines.append(f"Stripe **{ty}** — {STRIPE_ERRORS['types'][ty]}")
-    # Intent statuses (helpful hint if present)
     if found_statuses:
         st = found_statuses[0]
         lines.append(f"Status **{st}** — {STRIPE_ERRORS['intents'][st]}")
 
-    # Nothing matched → give a compact playbook
     if not lines:
         lines = [
             "I can help with Stripe errors. If you paste the JSON (type / code / decline_code), I’ll decode it.",
@@ -232,53 +218,42 @@ def explain_stripe_error(text: str) -> str:
             "• **rate_limit_error** → back off and retry.",
         ]
 
-    # Next steps (generic + safe)
     lines.append("Next steps: confirm the exact error fields, retry only idempotently, or collect a new payment method / contact bank if it’s a decline.")
-    # Keep response compact
     reply = " ".join(lines)
-    # Trim to ~120-160 words to stay concise
     if len(reply) > 900:
         reply = reply[:900].rstrip() + "…"
     return reply
 
 # ---------------- Seed Data (normalized) ----------------
 STATIC_FOODS = [
-    # Salad
     {"name": "Greek salad", "category": "salad", "price": 12},
     {"name": "Veg salad", "category": "salad", "price": 18},
     {"name": "Clover Salad", "category": "salad", "price": 16},
     {"name": "Chicken Salad", "category": "salad", "price": 24},
-    # Rolls
     {"name": "Lasagna Rolls", "category": "rolls", "price": 14},
     {"name": "Peri Peri Rolls", "category": "rolls", "price": 12},
     {"name": "Chicken Rolls", "category": "rolls", "price": 20},
     {"name": "Veg Rolls", "category": "rolls", "price": 15},
-    # Desserts
     {"name": "Ripple Ice Cream", "category": "desserts", "price": 14},
     {"name": "Fruit Ice Cream", "category": "desserts", "price": 22},
     {"name": "Jar Ice Cream", "category": "desserts", "price": 10},
     {"name": "Vanilla Ice Cream", "category": "desserts", "price": 12},
-    # Sandwich
     {"name": "Chicken Sandwich", "category": "sandwich", "price": 12},
     {"name": "Vegan Sandwich", "category": "sandwich", "price": 18},
     {"name": "Grilled Sandwich", "category": "sandwich", "price": 16},
     {"name": "Bread Sandwich", "category": "sandwich", "price": 24},
-    # Cake
     {"name": "Cup Cake", "category": "cake", "price": 14},
     {"name": "Vegan Cake", "category": "cake", "price": 12},
     {"name": "Butterscotch Cake", "category": "cake", "price": 20},
     {"name": "Sliced Cake", "category": "cake", "price": 15},
-    # Veg mains
     {"name": "Garlic Mushroom", "category": "veg", "price": 14},
     {"name": "Fried Cauliflower", "category": "veg", "price": 22},
     {"name": "Mix Veg Pulao", "category": "veg", "price": 10},
     {"name": "Rice Zucchini", "category": "veg", "price": 12},
-    # Pasta
     {"name": "Cheese Pasta", "category": "pasta", "price": 12},
     {"name": "Tomato Pasta", "category": "pasta", "price": 18},
     {"name": "Creamy Pasta", "category": "pasta", "price": 16},
     {"name": "Chicken Pasta", "category": "pasta", "price": 24},
-    # Noodles
     {"name": "Butter Noodles", "category": "noodles", "price": 14},
     {"name": "Veg Noodles", "category": "noodles", "price": 12},
     {"name": "Somen Noodles", "category": "noodles", "price": 20},
@@ -321,19 +296,44 @@ def trim_text(s: str, n: int) -> str:
 def take(iterable, n):
     return list(islice(iterable, n))
 
-# Case-insensitive exact category match
-def _names_for(cat: str, limit: int = 20) -> List[str]:
+# New: richer item fetch with price & category (used in context and some replies)
+def _items_for(cat: str, limit: int = 20):
     if db is None:
         return []
     try:
         cur = db["foods"].find(
             {"category": {"$regex": f"^{cat}$", "$options": "i"}},
-            {"name": 1}
+            {"name": 1, "price": 1, "category": 1}
         ).limit(limit)
-        return [d["name"] for d in cur if d.get("name")]
+        return [
+            {"name": d.get("name"), "price": d.get("price"), "category": d.get("category")}
+            for d in cur if d.get("name")
+        ]
     except Exception:
-        log.exception("names_for(%s) failed", cat)
+        log.exception("_items_for(%s) failed", cat)
         return []
+
+def _fmt_price(p):
+    if p is None:
+        return ""
+    try:
+        # show $12 or $12.5 cleanly
+        if float(p).is_integer():
+            return f"${int(float(p))}"
+        return f"${float(p)}"
+    except Exception:
+        return f"${p}"
+
+def _fmt_items(items):
+    return ", ".join(
+        f"{it['name']} ({_fmt_price(it.get('price'))})" if it.get("price") is not None else f"{it['name']}"
+        for it in items if it.get("name")
+    )
+
+# Keep simple name-only helpers (backward compatibility)
+def _names_for(cat: str, limit: int = 20) -> List[str]:
+    items = _items_for(cat, limit)
+    return [it["name"] for it in items]
 
 def get_popular_items(limit=MAX_POPULAR) -> List[str]:
     if db is None:
@@ -480,6 +480,92 @@ def bump_food_orders(items: List[dict]):
     except Exception:
         log.exception("bump_food_orders failed")
 
+# ---------------- LLM helpers ----------------
+SYSTEM_PROMPT = (
+    "You are TomatoAI, a concise, friendly customer support chatbot for a food delivery platform. "
+    "You help with menus, delivery times, tracking orders, refunds, and reorders.\n\n"
+    "Rules:\n"
+    "1) Use ONLY details from the provided database context for specifics like dish names, order IDs, or status.\n"
+    "2) If a specific detail is missing, ask ONE brief clarifying question or provide a safe generic step (e.g., how to check order status in-app).\n"
+    "3) Never invent order numbers, times, or policies. No markdown tables; short paragraphs or bullets only.\n"
+    "4) Keep answers under ~120 words unless the user explicitly asks for more.\n"
+)
+
+def llm_compose(system_prompt: str, content: str) -> str:
+    """
+    Ask the model to rewrite/compose a reply using our system rules.
+    Falls back to the given content on errors or if client is unavailable.
+    """
+    if client is None:
+        return content
+    try:
+        r = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content},
+            ],
+            temperature=0.3,
+            max_tokens=OPENAI_MAX_TOKENS,
+        )
+        out = (r.choices[0].message.content or "").strip()
+        if not out:
+            return content
+        # Optional: log usage to monitor costs
+        usage = getattr(r, "usage", None)
+        if usage:
+            log.info("openai tokens prompt=%s completion=%s total=%s",
+                     getattr(usage, "prompt_tokens", None),
+                     getattr(usage, "completion_tokens", None),
+                     getattr(usage, "total_tokens", None))
+        return out
+    except (APIConnectionError, RateLimitError, APIStatusError) as e:
+        log.error("llm_compose openai error type=%s msg=%s", type(e).__name__, str(e))
+        return content
+    except Exception as e:
+        log.exception("llm_compose unexpected err=%s", e)
+        return content
+
+def build_context(user_msg: str, user_id: Optional[str]) -> str:
+    mem_lines: List[str] = []
+    if memory:
+        try:
+            results = memory.search(query=user_msg, user_id=user_id) or {}
+            for m in take(results.get("results", []), 5):
+                val = m.get("memory")
+                if isinstance(val, str) and val.strip():
+                    mem_lines.append(f"- {val.strip()[:160]}")
+        except Exception:
+            pass
+
+    popular = take(get_popular_items(), MAX_POPULAR)
+    recent = take(get_user_recent_orders(user_id), MAX_RECENT)
+
+    # Enriched category lines with prices
+    sandwiches = _items_for("sandwich", MAX_POPULAR)
+    rolls      = _items_for("rolls", MAX_POPULAR)
+    veg        = _items_for("veg", MAX_POPULAR)
+    desserts   = _items_for("desserts", MAX_POPULAR)
+    salad      = _items_for("salad", MAX_POPULAR)
+    cake       = _items_for("cake", MAX_POPULAR)
+    pasta      = _items_for("pasta", MAX_POPULAR)
+    noodles    = _items_for("noodles", MAX_POPULAR)
+
+    ctx_parts: List[str] = []
+    if mem_lines:  ctx_parts.append("Relevant past information:\n" + "\n".join(mem_lines))
+    if popular:    ctx_parts.append("Popular dishes: " + ", ".join(popular))
+    if recent:     ctx_parts.append("User recent orders: " + ", ".join(recent))
+    if sandwiches: ctx_parts.append("Sandwich options: " + _fmt_items(sandwiches))
+    if rolls:      ctx_parts.append("Rolls options: " + _fmt_items(rolls))
+    if salad:      ctx_parts.append("Salad options: " + _fmt_items(salad))
+    if desserts:   ctx_parts.append("Dessert options: " + _fmt_items(desserts))
+    if cake:       ctx_parts.append("Cake options: " + _fmt_items(cake))
+    if pasta:      ctx_parts.append("Pasta options: " + _fmt_items(pasta))
+    if noodles:    ctx_parts.append("Noodles options: " + _fmt_items(noodles))
+    if veg:        ctx_parts.append("Veg options: " + _fmt_items(veg))
+
+    return ("Database context:\n" + "\n".join(ctx_parts) + "\n") if ctx_parts else ""
+
 # ---------------- API Models ----------------
 class ChatReq(BaseModel):
     message: str = Field(..., min_length=1, max_length=MAX_MSG_LEN)
@@ -489,7 +575,7 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.4.0")
+app = FastAPI(title="Tomato Chatbot API", version="1.5.0")
 
 @app.on_event("startup")
 def _seed_on_startup():
@@ -542,6 +628,7 @@ def debug():
         "model": OPENAI_MODEL,
         "db": DB_NAME,
         "db_ok": db_ok,
+        "force_llm": FORCE_LLM,
         "packages": {"openai": openai_ver},
     }
 
@@ -561,61 +648,13 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.4.0",
+        "version": "1.5.0",
+        "force_llm": FORCE_LLM,
     }
-
-SYSTEM_PROMPT = (
-    "You are TomatoAI, a concise, friendly customer support chatbot for a food delivery platform. "
-    "You help with menus, delivery times, tracking orders, refunds, and reorders.\n\n"
-    "Rules:\n"
-    "1) Use ONLY details from the provided database context for specifics like dish names, order IDs, or status.\n"
-    "2) If a specific detail is missing, ask ONE brief clarifying question or provide a safe generic step (e.g., how to check order status in-app).\n"
-    "3) Never invent order numbers, times, or policies. No markdown tables; short paragraphs or bullets only.\n"
-    "4) Keep answers under ~120 words unless the user explicitly asks for more.\n"
-)
-
-def build_context(user_msg: str, user_id: Optional[str]) -> str:
-    mem_lines: List[str] = []
-    if memory:
-        try:
-            results = memory.search(query=user_msg, user_id=user_id) or {}
-            for m in take(results.get("results", []), 5):
-                val = m.get("memory")
-                if isinstance(val, str) and val.strip():
-                    mem_lines.append(f"- {val.strip()[:160]}")
-        except Exception:
-            pass
-
-    popular = take(get_popular_items(), MAX_POPULAR)
-    recent = take(get_user_recent_orders(user_id), MAX_RECENT)
-
-    sandwiches = take(get_sandwich_names(), MAX_POPULAR)
-    rolls      = take(get_rolls_names(), MAX_POPULAR)
-    veg        = take(get_veg_names(), MAX_POPULAR)
-    desserts   = take(get_desserts_names(), MAX_POPULAR)
-    salad      = take(get_salad_names(), MAX_POPULAR)
-    cake       = take(get_cake_names(), MAX_POPULAR)
-    pasta      = take(get_pasta_names(), MAX_POPULAR)
-    noodles    = take(get_noodles_names(), MAX_POPULAR)
-
-    ctx_parts: List[str] = []
-    if mem_lines:  ctx_parts.append("Relevant past information:\n" + "\n".join(mem_lines))
-    if popular:    ctx_parts.append("Popular dishes: " + ", ".join(popular))
-    if recent:     ctx_parts.append("User recent orders: " + ", ".join(recent))
-    if sandwiches: ctx_parts.append("Sandwich options: " + ", ".join(sandwiches))
-    if rolls:      ctx_parts.append("Rolls options: " + ", ".join(rolls))
-    if salad:      ctx_parts.append("Salad options: " + ", ".join(salad))
-    if desserts:   ctx_parts.append("Dessert options: " + ", ".join(desserts))
-    if cake:       ctx_parts.append("Cake options: " + ", ".join(cake))
-    if pasta:      ctx_parts.append("Pasta options: " + ", ".join(pasta))
-    if noodles:    ctx_parts.append("Noodles options: " + ", ".join(noodles))
-    if veg:        ctx_parts.append("Veg options: " + ", ".join(veg))
-
-    return ("Database context:\n" + "\n".join(ctx_parts) + "\n") if ctx_parts else ""
 
 # ---------------- Chat ----------------
 @app.post("/chat", response_model=ChatResp)
-async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: Request = None):
+async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: Request = None, response: Response = None):
     # Auth
     if not safe_eq(x_service_auth, SHARED_SECRET):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -630,19 +669,32 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
     # ---- Stripe errors branch (DB/LLM not needed) ----
     if is_stripe_query(user_msg):
         reply = explain_stripe_error(user_msg)
+        if response is not None:
+            response.headers["X-Answer-Source"] = "rule:stripe"
         return ChatResp(reply=reply)
 
-    # ---- Popularity questions: answer from DB, no LLM needed ----
+    # ---- Popularity questions: answer from DB; optionally let LLM compose ----
     if is_popularity_query(user_msg):
         cat = category_from_query(user_msg)
         names = top_items_from_orders(limit=3, category=cat) or top_items_from_foods(limit=3, category=cat)
         if names:
-            if cat:
-                return ChatResp(reply=f"Our most-ordered {cat.rstrip('s')} right now: " + ", ".join(names) + ".")
+            draft = (
+                f"Our most-ordered {cat.rstrip('s')} right now: " + ", ".join(names) + "."
+                if cat else
+                "Top items customers are ordering: " + ", ".join(names) + "."
+            )
+            if FORCE_LLM:
+                db_context = build_context(user_msg, user_id)
+                content = f"{db_context}\nCustomer: {user_msg}\nDraft: {draft}\nRewrite the draft for the customer, following the rules."
+                draft = llm_compose(SYSTEM_PROMPT, content)
+                if response is not None:
+                    response.headers["X-Answer-Source"] = "rule+llm:popularity"
             else:
-                return ChatResp(reply="Top items customers are ordering: " + ", ".join(names) + ".")
+                if response is not None:
+                    response.headers["X-Answer-Source"] = "rule:popularity"
+            return ChatResp(reply=draft)
 
-    # ---- Category-first answers (no LLM needed) ----
+    # ---- Category-first answers (no LLM needed to fetch; optionally LLM to compose) ----
     cat = category_from_query(user_msg)
     if cat:
         fetch_map = {
@@ -659,7 +711,17 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
         if fetcher:
             names = fetcher(limit=20)
             if names:
-                return ChatResp(reply=f"Our {cat.rstrip('s')} options include: " + ", ".join(names[:10]) + ".")
+                draft = f"Our {cat.rstrip('s')} options include: " + ", ".join(names[:10]) + "."
+                if FORCE_LLM:
+                    db_context = build_context(user_msg, user_id)
+                    content = f"{db_context}\nCustomer: {user_msg}\nDraft: {draft}\nRewrite the draft for the customer, following the rules."
+                    draft = llm_compose(SYSTEM_PROMPT, content)
+                    if response is not None:
+                        response.headers["X-Answer-Source"] = "rule+llm:category"
+                else:
+                    if response is not None:
+                        response.headers["X-Answer-Source"] = "rule:category"
+                return ChatResp(reply=draft)
 
     # ---- Build LLM context ----
     db_context = build_context(user_msg, user_id)
@@ -669,10 +731,12 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
     if client is None:
         popular = top_items_from_orders(limit=10) or get_popular_items()
         if popular:
+            if response is not None:
+                response.headers["X-Answer-Source"] = "fallback:popular"
             return ChatResp(reply="I’m temporarily offline. Popular dishes: " + ", ".join(popular[:10]) + ".")
         raise HTTPException(status_code=503, detail="Assistant temporarily unavailable")
 
-    # ---- Call OpenAI (NO 'timeout=' kwarg here) ----
+    # ---- Call OpenAI (primary LLM path) ----
     try:
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -684,16 +748,29 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             max_tokens=OPENAI_MAX_TOKENS,
         )
         answer = (completion.choices[0].message.content or "").strip()
+        if response is not None:
+            response.headers["X-Answer-Source"] = "llm"
+        # Optional: log usage
+        usage = getattr(completion, "usage", None)
+        if usage:
+            log.info("openai tokens prompt=%s completion=%s total=%s",
+                     getattr(usage, "prompt_tokens", None),
+                     getattr(usage, "completion_tokens", None),
+                     getattr(usage, "total_tokens", None))
     except (APIConnectionError, RateLimitError, APIStatusError) as e:
         log.error("openai error req_id=%s type=%s msg=%s", req_id, type(e).__name__, str(e))
         popular = get_popular_items()
         if popular:
+            if response is not None:
+                response.headers["X-Answer-Source"] = "fallback:popular_on_error"
             return ChatResp(reply="I’m having trouble reaching the assistant. Popular dishes: " + ", ".join(popular[:10]) + ".")
         raise HTTPException(status_code=502, detail="Chat service upstream error")
     except Exception as e:
         log.exception("openai unexpected req_id=%s err=%s", req_id, e)
         popular = get_popular_items()
         if popular:
+            if response is not None:
+                response.headers["X-Answer-Source"] = "fallback:popular_on_exception"
             return ChatResp(reply="I’m having trouble reaching the assistant. Popular dishes: " + ", ".join(popular[:10]) + ".")
         raise HTTPException(status_code=502, detail="Chat service upstream error")
 
