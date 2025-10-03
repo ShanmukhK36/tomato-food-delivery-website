@@ -14,6 +14,12 @@ from pymongo.errors import PyMongoError
 from openai import OpenAI, APIConnectionError, RateLimitError, APIStatusError
 from dotenv import load_dotenv
 
+# Try to import ObjectId safely (so local dev without bson won't crash import)
+try:
+    from bson import ObjectId
+except Exception:
+    ObjectId = None
+
 # ---------------- Env & Logging ----------------
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -31,15 +37,13 @@ MONGO_URI       = os.getenv("MONGO_URI")
 DB_NAME         = os.getenv("DB_NAME", "food-delivery")
 
 USE_MEMORY      = os.getenv("USE_MEMORY", "0") == "1"  # default off on Vercel
-
-# New: allow forcing the LLM to compose final text even for rule-based branches
-FORCE_LLM       = os.getenv("FORCE_LLM", "0") == "1"
+FORCE_LLM       = os.getenv("FORCE_LLM", "0") == "1"   # optional: let LLM rewrite deterministic drafts
 
 # OpenAI client (safe init; do NOT crash if missing/misconfigured)
 client = None
 if OPENAI_API_KEY:
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT)  # explicit api_key
+        client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT)
     except Exception as e:
         log.exception("OpenAI client init failed: %s", e)
         client = None
@@ -126,7 +130,7 @@ STRIPE_ERRORS = {
         "lost_card": "The card was reported lost. The bank blocked it. Use a different card.",
         "stolen_card": "The card was reported stolen. The bank blocked it. Use a different card.",
         "do_not_honor": "The bank declined without a reason. Ask the customer to contact their bank or use another card.",
-        "generic_decline": "A generic decline from the bank. Try again later or use a different method.",
+        "generic_decline": "A generic decline from the bank. Try again later or a different method.",
         "pickup_card": "The bank requests to retain the card (severe flag). Use another card.",
         "reenter_transaction": "Try entering the transaction again. If it repeats, use another card.",
         "try_again_later": "Temporary issue at the bank. Try again later or another method.",
@@ -335,6 +339,22 @@ def _names_for(cat: str, limit: int = 20) -> List[str]:
     items = _items_for(cat, limit)
     return [it["name"] for it in items]
 
+def _possible_user_id_filters(user_id: str):
+    """
+    Build a robust $or filter that matches either string or ObjectId
+    across common field spellings: 'user_id' and 'userId'.
+    """
+    if not user_id:
+        return None
+    or_terms = [{"user_id": user_id}, {"userId": user_id}]
+    if ObjectId:
+        try:
+            oid = ObjectId(user_id)
+            or_terms.extend([{"user_id": oid}, {"userId": oid}])
+        except Exception:
+            pass
+    return {"$or": or_terms}
+
 def get_popular_items(limit=MAX_POPULAR) -> List[str]:
     if db is None:
         return []
@@ -346,12 +366,19 @@ def get_popular_items(limit=MAX_POPULAR) -> List[str]:
         return []
 
 def get_user_recent_orders(user_id: Optional[str], limit=MAX_RECENT) -> List[str]:
+    """
+    Robustly fetch recent orders for a user, matching both string and ObjectId
+    in both 'user_id' and 'userId' fields.
+    """
     if db is None or not user_id or user_id == "guest":
         return []
     try:
+        flt = _possible_user_id_filters(user_id)
+        if not flt:
+            return []
         cur = (
             db["orders"]
-            .find({"user_id": user_id}, {"order_id": 1})
+            .find(flt, {"order_id": 1})
             .sort("order_date", -1)
             .limit(limit)
         )
@@ -585,7 +612,7 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.6.0")
+app = FastAPI(title="Tomato Chatbot API", version="1.6.2")
 
 @app.on_event("startup")
 def _seed_on_startup():
@@ -658,7 +685,7 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.6.0",
+        "version": "1.6.2",
         "force_llm": FORCE_LLM,
     }
 
@@ -675,6 +702,12 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
 
     user_id = req.userId or None
     req_id = getattr(request.state, "req_id", "n/a")
+
+    # For quick debugging in browser devtools
+    if response is not None:
+        response.headers["X-UserId-Received"] = "1" if (user_id is not None) else "0"
+        if user_id:
+            response.headers["X-UserId"] = str(user_id)
 
     # ---- Stripe errors branch (DB/LLM not needed) ----
     if is_stripe_query(user_msg):
