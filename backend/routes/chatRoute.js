@@ -1,21 +1,23 @@
 import express from "express";
 import { randomUUID } from "crypto";
+import jwt from "jsonwebtoken";
 
 const router = express.Router();
 
 const PY_CHAT_URL = process.env.PY_CHAT_URL ?? "http://localhost:8000/chat";
 const SHARED_SECRET = process.env.SHARED_SECRET ?? "dev-secret";
+const JWT_KEY = process.env.JWT_KEY; // must match your user controller
 const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS ?? 8000);
 const MAX_MESSAGE_LEN = Number(process.env.MAX_MESSAGE_LEN ?? 2000);
 const MAX_RETRIES = Number(process.env.UPSTREAM_RETRIES ?? 2); // total attempts
 
-// Simple schema (no deps)
+// Simple schema (no deps): client may NOT send userId
 function validateBody(body) {
   if (!body || typeof body.message !== "string") return "message must be a string";
   const msg = body.message.trim();
   if (!msg) return "message is required";
   if (msg.length > MAX_MESSAGE_LEN) return `message too long (>${MAX_MESSAGE_LEN})`;
-  if (body.userId != null && typeof body.userId !== "string") return "userId must be a string";
+  // ignore any client-sent userId; we derive it from JWT
   return null;
 }
 
@@ -25,7 +27,7 @@ function logJSON(level, obj) {
 
 async function fetchWithTimeout(url, init, timeoutMs) {
   const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), timeoutMs);
+  const t = setTimeout(() => ac.abort(new Error("upstream timeout")), timeoutMs);
   try {
     return await fetch(url, { ...init, signal: ac.signal });
   } finally {
@@ -33,18 +35,53 @@ async function fetchWithTimeout(url, init, timeoutMs) {
   }
 }
 
+// ----- JWT helpers -----
+function getBearerToken(req) {
+  const auth = req.headers.authorization || req.headers.Authorization;
+  if (auth && typeof auth === "string" && auth.startsWith("Bearer ")) {
+    return auth.slice(7).trim();
+  }
+  return null;
+}
+
+function getCookieToken(req) {
+  const raw = req.headers.cookie;
+  if (!raw) return null;
+  const parts = raw.split(";").map((s) => s.trim());
+  const pair = parts.find((p) => p.startsWith("token="));
+  if (!pair) return null;
+  return decodeURIComponent(pair.split("=").slice(1).join("="));
+}
+
+function getUserIdFromRequest(req) {
+  try {
+    const token = getBearerToken(req) || getCookieToken(req);
+    if (!token || !JWT_KEY) return null;
+    const payload = jwt.verify(token, JWT_KEY); // you sign as { id: user._id }
+    return payload?.id || null;
+  } catch {
+    return null; // invalid/expired token → anonymous
+  }
+}
+
+// ---------------- Route ----------------
 router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
   const reqId = req.headers["x-request-id"] || randomUUID();
 
-  // Validate input
+  // Validate input (message only)
   const errMsg = validateBody(req.body);
   if (errMsg) {
     return res.status(400).json({ error: errMsg, requestId: reqId });
   }
 
-  const { message, userId } = req.body;
+  const message = String(req.body.message).trim();
 
-  // Build upstream request once
+  // Derive userId from JWT (Authorization header or cookie). Do NOT trust client body.
+  const userId = getUserIdFromRequest(req) || undefined;
+
+  // Build upstream request (only include userId if present)
+  const upstreamBody = userId ? { message, userId } : { message };
+
   const buildInit = () => ({
     method: "POST",
     headers: {
@@ -52,12 +89,10 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
       "x-service-auth": SHARED_SECRET, // must match Python SHARED_SECRET
       "x-request-id": reqId,           // pass through for tracing
     },
-    body: JSON.stringify({ message, userId }),
+    body: JSON.stringify(upstreamBody),
   });
 
-  const tryOnce = async () => {
-    return fetchWithTimeout(PY_CHAT_URL, buildInit(), UPSTREAM_TIMEOUT_MS);
-  };
+  const tryOnce = async () => fetchWithTimeout(PY_CHAT_URL, buildInit(), UPSTREAM_TIMEOUT_MS);
 
   let upstreamRes;
   let attempt = 0;
@@ -123,9 +158,10 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     route: "POST /api/chat",
     upstreamStatus: upstreamRes.status,
     mappedStatus: passthroughStatus,
-    len: String(message).length,
+    len: message.length,
     attempts: attempt,
     answerSource: upstreamAnswerSource ?? null,
+    hasUserId: Boolean(userId),
   });
 
   return res.status(passthroughStatus).json({ ...data, requestId: upstreamReqId });
