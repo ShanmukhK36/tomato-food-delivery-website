@@ -111,7 +111,7 @@ STRIPE_ERRORS = {
         "charge_already_refunded": "The charge is already refunded. Avoid duplicate refunds.",
         "payment_intent_unexpected_state": "PaymentIntent is in a state that doesn’t allow the action. Fetch its latest status and follow the lifecycle.",
         "setup_intent_unexpected_state": "SetupIntent can’t perform the action in its current status. Refresh and follow the required step.",
-        "authentication_required": "Strong customer authentication (3DS) is required. Present 3DS / next_action to the customer.",
+        "authentication_required": "Strong customer authentication (3DS) is required. Present 3D Secure to complete the payment.",
         "invalid_number": "The card number is incorrect. Ask the customer to re-enter the card.",
         "invalid_expiry_month": "Invalid expiry month.",
         "invalid_expiry_year": "Invalid expiry year.",
@@ -346,7 +346,7 @@ def get_popular_items(limit=MAX_POPULAR) -> List[str]:
         return []
 
 def get_user_recent_orders(user_id: Optional[str], limit=MAX_RECENT) -> List[str]:
-    if db is None or not user_id:
+    if db is None or not user_id or user_id == "guest":
         return []
     try:
         cur = (
@@ -566,6 +566,16 @@ def build_context(user_msg: str, user_id: Optional[str]) -> str:
 
     return ("Database context:\n" + "\n".join(ctx_parts) + "\n") if ctx_parts else ""
 
+# ---------------- Previous Orders intent ----------------
+_PREV_ORDERS_KEYWORDS = (
+    "previous orders", "past orders", "order history", "my orders",
+    "recent orders", "last order", "my last order", "history of orders",
+    "show my orders", "show my previous orders", "show my recent orders"
+)
+def is_previous_orders_query(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in _PREV_ORDERS_KEYWORDS)
+
 # ---------------- API Models ----------------
 class ChatReq(BaseModel):
     message: str = Field(..., min_length=1, max_length=MAX_MSG_LEN)
@@ -575,7 +585,7 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.5.0")
+app = FastAPI(title="Tomato Chatbot API", version="1.6.0")
 
 @app.on_event("startup")
 def _seed_on_startup():
@@ -648,7 +658,7 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.5.0",
+        "version": "1.6.0",
         "force_llm": FORCE_LLM,
     }
 
@@ -672,6 +682,26 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
         if response is not None:
             response.headers["X-Answer-Source"] = "rule:stripe"
         return ChatResp(reply=reply)
+
+    # ---- Previous orders branch ----
+    if is_previous_orders_query(user_msg):
+        if not user_id or user_id == "guest":
+            text = "To show your past orders, please log in. Once you’re signed in, ask “show my recent orders.”"
+            if response is not None:
+                response.headers["X-Answer-Source"] = "rule:orders_login_required"
+            return ChatResp(reply=text)
+
+        orders = get_user_recent_orders(user_id, limit=MAX_RECENT)
+        if orders:
+            text = "Your recent orders: " + ", ".join(orders) + ". Want details for one of them?"
+            if response is not None:
+                response.headers["X-Answer-Source"] = "rule:orders_list"
+            return ChatResp(reply=text)
+        else:
+            text = "I couldn’t find past orders for your account yet. You can place an order and I’ll track it here."
+            if response is not None:
+                response.headers["X-Answer-Source"] = "rule:orders_none"
+            return ChatResp(reply=text)
 
     # ---- Popularity questions: answer from DB; optionally let LLM compose ----
     if is_popularity_query(user_msg):

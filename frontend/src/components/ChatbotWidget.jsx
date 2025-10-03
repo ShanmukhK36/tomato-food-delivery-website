@@ -8,6 +8,7 @@ const ChatbotWidget = () => {
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [userIdState, setUserIdState] = useState(() => localStorage.getItem("userId") || "guest");
   const [messages, setMessages] = useState(() => {
     const userId = localStorage.getItem("userId") || "guest";
     const cached = localStorage.getItem(`tomatoai:${userId}:messages`);
@@ -24,17 +25,14 @@ const ChatbotWidget = () => {
         ];
   });
 
-  const userId = useMemo(() => localStorage.getItem("userId") || "guest", []);
+  const userId = useMemo(() => userIdState, [userIdState]);
   const controllerRef = useRef(null);
   const inputRef = useRef(null);
   const endRef = useRef(null);
 
   // Persist messages per user
   useEffect(() => {
-    localStorage.setItem(
-      `tomatoai:${userId}:messages`,
-      JSON.stringify(messages)
-    );
+    localStorage.setItem(`tomatoai:${userId}:messages`, JSON.stringify(messages));
   }, [messages, userId]);
 
   // Scroll to bottom on open/new messages
@@ -46,6 +44,41 @@ const ChatbotWidget = () => {
   useEffect(() => {
     if (open) setTimeout(() => inputRef.current?.focus(), 0);
   }, [open]);
+
+  // Switch user: load that user's history (or seed)
+  useEffect(() => {
+    const cached = localStorage.getItem(`tomatoai:${userId}:messages`);
+    setMessages(
+      cached
+        ? JSON.parse(cached)
+        : [
+            {
+              id: uid(),
+              role: "assistant",
+              content:
+                userId === "guest"
+                  ? "Hi! I’m TomatoAI. Log in to see your previous orders. How can I help today?"
+                  : "Hi again! You’re logged in—ask me to show your recent orders.",
+              ts: Date.now(),
+            },
+          ]
+    );
+  }, [userId]);
+
+  const login = () => {
+    const entered = window.prompt("Enter your user ID (email or account id):", "");
+    const val = (entered || "").trim();
+    if (!val) return;
+    localStorage.setItem("userId", val);
+    setUserIdState(val);
+  };
+
+  const logout = () => {
+    // Clear this user's local chat history (optional)
+    localStorage.removeItem(`tomatoai:${userId}:messages`);
+    localStorage.setItem("userId", "guest");
+    setUserIdState("guest");
+  };
 
   const sendMessage = async (e) => {
     e?.preventDefault();
@@ -140,23 +173,43 @@ const ChatbotWidget = () => {
       {/* Chat panel */}
       {open && (
         <div
-          className="fixed bottom-20 right-5 z-50 w-80 sm:w-96 h-[560px] bg-white border border-gray-200 rounded-2xl shadow-2xl flex flex-col"
+          className="fixed bottom-20 right-5 z-50 w-80 sm:w-96 h-[600px] bg-white border border-gray-200 rounded-2xl shadow-2xl flex flex-col"
           role="dialog"
           aria-modal="true"
           aria-labelledby="tomatoai-title"
         >
-          {/* Header */}
-          <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
+          {/* Header with simple auth controls */}
+          <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between gap-2">
             <div id="tomatoai-title" className="font-semibold">
               TomatoAI
+              <span className="ml-2 text-xs text-gray-500">
+                {userId === "guest" ? "(guest)" : `(${userId})`}
+              </span>
             </div>
-            <button
-              onClick={() => setOpen(false)}
-              className="text-gray-500 hover:text-gray-700"
-              aria-label="Close chat"
-            >
-              ✕
-            </button>
+            <div className="flex items-center gap-2">
+              {userId === "guest" ? (
+                <button
+                  onClick={login}
+                  className="text-xs px-2 py-1 rounded bg-gray-900 text-white hover:bg-black"
+                >
+                  Login
+                </button>
+              ) : (
+                <button
+                  onClick={logout}
+                  className="text-xs px-2 py-1 rounded bg-gray-200 hover:bg-gray-300"
+                >
+                  Logout
+                </button>
+              )}
+              <button
+                onClick={() => setOpen(false)}
+                className="text-gray-500 hover:text-gray-700"
+                aria-label="Close chat"
+              >
+                ✕
+              </button>
+            </div>
           </div>
 
           {/* Messages */}
@@ -169,23 +222,16 @@ const ChatbotWidget = () => {
             {messages.map((m) => (
               <div
                 key={m.id}
-                className={`flex ${
-                  m.role === "user" ? "justify-end" : "justify-start"
-                }`}
+                className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
               >
                 <div
                   className={`max-w-[80%] rounded-2xl px-3 py-2 text-sm ${
-                    m.role === "user"
-                      ? "bg-orange-500 text-white"
-                      : "bg-gray-100 text-gray-900"
+                    m.role === "user" ? "bg-orange-500 text-white" : "bg-gray-100 text-gray-900"
                   }`}
                 >
                   <p className="whitespace-pre-wrap break-words">{m.content}</p>
                   <span className="mt-1 block text-[10px] opacity-70">
-                    {new Date(m.ts).toLocaleTimeString([], {
-                      hour: "2-digit",
-                      minute: "2-digit",
-                    })}
+                    {new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                     {m.error && (
                       <>
                         {" · "}
@@ -202,11 +248,7 @@ const ChatbotWidget = () => {
                 </div>
               </div>
             ))}
-            {loading && (
-              <div className="text-xs text-gray-500 italic px-2">
-                TomatoAI is typing…
-              </div>
-            )}
+            {loading && <div className="text-xs text-gray-500 italic px-2">TomatoAI is typing…</div>}
             <div ref={endRef} />
           </div>
 
