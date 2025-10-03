@@ -31,13 +31,15 @@ MONGO_URI       = os.getenv("MONGO_URI")
 DB_NAME         = os.getenv("DB_NAME", "food-delivery")
 
 USE_MEMORY      = os.getenv("USE_MEMORY", "0") == "1"  # default off on Vercel
-FORCE_LLM       = os.getenv("FORCE_LLM", "0") == "1"   # optional: let LLM rewrite deterministic drafts
+
+# New: allow forcing the LLM to compose final text even for rule-based branches
+FORCE_LLM       = os.getenv("FORCE_LLM", "0") == "1"
 
 # OpenAI client (safe init; do NOT crash if missing/misconfigured)
 client = None
 if OPENAI_API_KEY:
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT)
+        client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT)  # explicit api_key
     except Exception as e:
         log.exception("OpenAI client init failed: %s", e)
         client = None
@@ -81,6 +83,7 @@ POPULARITY_START  = 50
 
 # ---------------- Stripe error knowledge ----------------
 def _n(s: str) -> str:
+    """normalize key: lower + replace spaces/dashes with underscores"""
     return (s or "").strip().lower().replace("-", "_").replace(" ", "_")
 
 STRIPE_ERRORS = {
@@ -123,7 +126,7 @@ STRIPE_ERRORS = {
         "lost_card": "The card was reported lost. The bank blocked it. Use a different card.",
         "stolen_card": "The card was reported stolen. The bank blocked it. Use a different card.",
         "do_not_honor": "The bank declined without a reason. Ask the customer to contact their bank or use another card.",
-        "generic_decline": "A generic decline from the bank. Try again later or a different method.",
+        "generic_decline": "A generic decline from the bank. Try again later or use a different method.",
         "pickup_card": "The bank requests to retain the card (severe flag). Use another card.",
         "reenter_transaction": "Try entering the transaction again. If it repeats, use another card.",
         "try_again_later": "Temporary issue at the bank. Try again later or another method.",
@@ -258,6 +261,7 @@ STATIC_FOODS = [
 ]
 
 def bootstrap_foods_if_empty():
+    """Upsert a small menu so DB answers work immediately."""
     if db is None:
         return
     try:
@@ -292,6 +296,7 @@ def trim_text(s: str, n: int) -> str:
 def take(iterable, n):
     return list(islice(iterable, n))
 
+# New: richer item fetch with price & category (used in context and some replies)
 def _items_for(cat: str, limit: int = 20):
     if db is None:
         return []
@@ -312,7 +317,10 @@ def _fmt_price(p):
     if p is None:
         return ""
     try:
-        return f"${int(float(p))}" if float(p).is_integer() else f"${float(p)}"
+        # show $12 or $12.5 cleanly
+        if float(p).is_integer():
+            return f"${int(float(p))}"
+        return f"${float(p)}"
     except Exception:
         return f"${p}"
 
@@ -322,6 +330,7 @@ def _fmt_items(items):
         for it in items if it.get("name")
     )
 
+# Keep simple name-only helpers (backward compatibility)
 def _names_for(cat: str, limit: int = 20) -> List[str]:
     items = _items_for(cat, limit)
     return [it["name"] for it in items]
@@ -361,6 +370,7 @@ def get_pasta_names(limit=20):    return _names_for("pasta", limit)
 def get_noodles_names(limit=20):  return _names_for("noodles", limit)
 def get_veg_names(limit=20):      return _names_for("veg", limit)
 
+# Map query text to a canonical category
 SYNONYMS = {
     "sub": "sandwich", "subs": "sandwich", "hoagie": "sandwich",
     "wrap": "rolls", "wraps": "rolls",
@@ -380,7 +390,9 @@ def category_from_query(text: str) -> Optional[str]:
             return canon
     return None
 
+# -------- Popularity helpers --------
 POPULAR_KEYWORDS = ("popular", "best", "bestseller", "most ordered", "most-ordered", "top", "famous", "hot")
+
 def is_popularity_query(text: str) -> bool:
     t = (text or "").lower()
     return any(k in t for k in POPULAR_KEYWORDS)
@@ -416,9 +428,10 @@ def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> Lis
                         "as": "food"
                     }
                 },
-                {"$match": {"food.0": {"$exists": True}}}
+                {"$match": {"food.0": {"$exists": True}}},
+                {"$addFields": {"canonName": {"$arrayElemAt": ["$food.name", 0]}}},
             ]
-            group_key = "$food.name"
+            group_key = "$canonName"
         else:
             group_key = {"$toLower": "$items.name"}
 
@@ -432,8 +445,6 @@ def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> Lis
         names: List[str] = []
         for r in rows:
             name = r["_id"]
-            if isinstance(name, list) and name:
-                name = name[0]
             if isinstance(name, dict):
                 name = name.get("name") or name.get("_id") or ""
             if isinstance(name, str) and name:
@@ -463,10 +474,13 @@ def bump_food_orders(items: List[dict]):
         for it in items or []:
             name = (it.get("name") or "").strip()
             qty = int(it.get("qty") or 1)
+            if not name:
+                continue
             db["foods"].update_one({"name": name}, {"$inc": {"orders": qty}})
     except Exception:
         log.exception("bump_food_orders failed")
 
+# ---------------- LLM helpers ----------------
 SYSTEM_PROMPT = (
     "You are TomatoAI, a concise, friendly customer support chatbot for a food delivery platform. "
     "You help with menus, delivery times, tracking orders, refunds, and reorders.\n\n"
@@ -478,6 +492,10 @@ SYSTEM_PROMPT = (
 )
 
 def llm_compose(system_prompt: str, content: str) -> str:
+    """
+    Ask the model to rewrite/compose a reply using our system rules.
+    Falls back to the given content on errors or if client is unavailable.
+    """
     if client is None:
         return content
     try:
@@ -493,6 +511,7 @@ def llm_compose(system_prompt: str, content: str) -> str:
         out = (r.choices[0].message.content or "").strip()
         if not out:
             return content
+        # Optional: log usage to monitor costs
         usage = getattr(r, "usage", None)
         if usage:
             log.info("openai tokens prompt=%s completion=%s total=%s",
@@ -522,6 +541,7 @@ def build_context(user_msg: str, user_id: Optional[str]) -> str:
     popular = take(get_popular_items(), MAX_POPULAR)
     recent = take(get_user_recent_orders(user_id), MAX_RECENT)
 
+    # Enriched category lines with prices
     sandwiches = _items_for("sandwich", MAX_POPULAR)
     rolls      = _items_for("rolls", MAX_POPULAR)
     veg        = _items_for("veg", MAX_POPULAR)
@@ -546,7 +566,7 @@ def build_context(user_msg: str, user_id: Optional[str]) -> str:
 
     return ("Database context:\n" + "\n".join(ctx_parts) + "\n") if ctx_parts else ""
 
-# -------- Previous Orders intent --------
+# ---------------- Previous Orders intent ----------------
 _PREV_ORDERS_KEYWORDS = (
     "previous orders", "past orders", "order history", "my orders",
     "recent orders", "last order", "my last order", "history of orders",
@@ -565,12 +585,13 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.6.1")
+app = FastAPI(title="Tomato Chatbot API", version="1.6.0")
 
 @app.on_event("startup")
 def _seed_on_startup():
     bootstrap_foods_if_empty()
 
+# Middleware adds x-request-id and prevents raw 500s from leaking
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
     req_id = request.headers.get("x-request-id") or os.urandom(8).hex()
@@ -587,6 +608,7 @@ async def add_request_id(request: Request, call_next):
     response.headers["x-request-id"] = req_id
     return response
 
+# Friendly root + route lister
 @app.get("/")
 def root():
     return {"ok": True, "service": "Tomato Chatbot API", "routes": [r.path for r in app.routes]}
@@ -636,13 +658,14 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.6.1",
+        "version": "1.6.0",
         "force_llm": FORCE_LLM,
     }
 
 # ---------------- Chat ----------------
 @app.post("/chat", response_model=ChatResp)
 async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: Request = None, response: Response = None):
+    # Auth
     if not safe_eq(x_service_auth, SHARED_SECRET):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -653,17 +676,17 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
     user_id = req.userId or None
     req_id = getattr(request.state, "req_id", "n/a")
 
-    # Stripe branch
+    # ---- Stripe errors branch (DB/LLM not needed) ----
     if is_stripe_query(user_msg):
         reply = explain_stripe_error(user_msg)
         if response is not None:
             response.headers["X-Answer-Source"] = "rule:stripe"
         return ChatResp(reply=reply)
 
-    # Previous orders branch (no frontend login UI; just instruct to log in on the website)
+    # ---- Previous orders branch ----
     if is_previous_orders_query(user_msg):
         if not user_id or user_id == "guest":
-            text = "Please log in on the website to view your past orders. Once you’re signed in, ask “show my recent orders.”"
+            text = "To show your past orders, please log in. Once you’re signed in, ask “show my recent orders.”"
             if response is not None:
                 response.headers["X-Answer-Source"] = "rule:orders_login_required"
             return ChatResp(reply=text)
@@ -680,7 +703,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                 response.headers["X-Answer-Source"] = "rule:orders_none"
             return ChatResp(reply=text)
 
-    # Popularity: DB → (optional) LLM compose
+    # ---- Popularity questions: answer from DB; optionally let LLM compose ----
     if is_popularity_query(user_msg):
         cat = category_from_query(user_msg)
         names = top_items_from_orders(limit=3, category=cat) or top_items_from_foods(limit=3, category=cat)
@@ -701,7 +724,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                     response.headers["X-Answer-Source"] = "rule:popularity"
             return ChatResp(reply=draft)
 
-    # Category answers: DB → (optional) LLM compose
+    # ---- Category-first answers (no LLM needed to fetch; optionally LLM to compose) ----
     cat = category_from_query(user_msg)
     if cat:
         fetch_map = {
@@ -730,10 +753,11 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                         response.headers["X-Answer-Source"] = "rule:category"
                 return ChatResp(reply=draft)
 
-    # Primary LLM path
+    # ---- Build LLM context ----
     db_context = build_context(user_msg, user_id)
     full_prompt = f"{db_context}\nCustomer: {user_msg}\nSupport Agent:"
 
+    # ---- Graceful fallback if LLM unavailable ----
     if client is None:
         popular = top_items_from_orders(limit=10) or get_popular_items()
         if popular:
@@ -742,6 +766,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             return ChatResp(reply="I’m temporarily offline. Popular dishes: " + ", ".join(popular[:10]) + ".")
         raise HTTPException(status_code=503, detail="Assistant temporarily unavailable")
 
+    # ---- Call OpenAI (primary LLM path) ----
     try:
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -755,6 +780,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
         answer = (completion.choices[0].message.content or "").strip()
         if response is not None:
             response.headers["X-Answer-Source"] = "llm"
+        # Optional: log usage
         usage = getattr(completion, "usage", None)
         if usage:
             log.info("openai tokens prompt=%s completion=%s total=%s",
@@ -778,6 +804,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             return ChatResp(reply="I’m having trouble reaching the assistant. Popular dishes: " + ", ".join(popular[:10]) + ".")
         raise HTTPException(status_code=502, detail="Chat service upstream error")
 
+    # ---- Persist memory (best-effort) ----
     if memory and user_id:
         try:
             memory.add(user_msg, user_id=user_id, metadata={"app_id": "tomato", "role": "user"})
