@@ -11,13 +11,13 @@ const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS ?? 8000);
 const MAX_MESSAGE_LEN = Number(process.env.MAX_MESSAGE_LEN ?? 2000);
 const MAX_RETRIES = Number(process.env.UPSTREAM_RETRIES ?? 2); // total attempts
 
-// Simple schema (no deps): client may NOT send userId
+// ---------- helpers ----------
 function validateBody(body) {
   if (!body || typeof body.message !== "string") return "message must be a string";
   const msg = body.message.trim();
   if (!msg) return "message is required";
   if (msg.length > MAX_MESSAGE_LEN) return `message too long (>${MAX_MESSAGE_LEN})`;
-  // ignore any client-sent userId; we derive it from JWT
+  // Ignore any client-sent userId; we derive it from JWT
   return null;
 }
 
@@ -35,7 +35,7 @@ async function fetchWithTimeout(url, init, timeoutMs) {
   }
 }
 
-// ----- JWT helpers -----
+// ----- JWT / userId derivation -----
 function getBearerToken(req) {
   const auth = req.headers.authorization || req.headers.Authorization;
   if (auth && typeof auth === "string" && auth.startsWith("Bearer ")) {
@@ -53,15 +53,28 @@ function getCookieToken(req) {
   return decodeURIComponent(pair.split("=").slice(1).join("="));
 }
 
+/**
+ * Return userId from a verified JWT ({ id: <mongoId> }) or null.
+ * If no valid JWT, allow a DEV-ONLY override via header/query.
+ */
 function getUserIdFromRequest(req) {
+  // 1) Real auth path: Authorization or cookie
   try {
     const token = getBearerToken(req) || getCookieToken(req);
-    if (!token || !JWT_KEY) return null;
-    const payload = jwt.verify(token, JWT_KEY); // you sign as { id: user._id }
-    return payload?.id || null;
+    if (token && JWT_KEY) {
+      const payload = jwt.verify(token, JWT_KEY);
+      if (payload?.id) return String(payload.id);
+    }
   } catch {
-    return null; // invalid/expired token → anonymous
+    // invalid/expired token → fall through to debug overrides
   }
+
+  // 2) Dev override (only when no valid JWT): header or query param
+  const debugHeader = req.headers["x-debug-userid"];
+  const debugQuery = req.query?.debug_user_id;
+  const override = (typeof debugHeader === "string" && debugHeader.trim()) ||
+                   (typeof debugQuery === "string" && debugQuery.trim());
+  return override || null;
 }
 
 // ---------------- Route ----------------
@@ -76,7 +89,7 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
 
   const message = String(req.body.message).trim();
 
-  // Derive userId from JWT (Authorization header or cookie). Do NOT trust client body.
+  // Derive userId from JWT (or debug override). Do NOT trust client body.
   const userId = getUserIdFromRequest(req) || undefined;
 
   // Build upstream request (only include userId if present)
@@ -126,6 +139,7 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
   // Capture upstream headers
   const upstreamAnswerSource = upstreamRes.headers.get("x-answer-source") || undefined;
   const upstreamReqId = upstreamRes.headers.get("x-request-id") || reqId;
+  const upstreamEchoUserId = upstreamRes.headers.get("x-echo-userid") || "";
 
   // Parse JSON safely
   let data;
@@ -141,13 +155,20 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     data = { reply: "" };
   }
 
-  // Surface answer source in header and body (non-breaking)
-  if (upstreamAnswerSource) {
-    res.setHeader("X-Answer-Source", upstreamAnswerSource);
-    if (data && typeof data === "object" && data.answerSource == null) {
+  // Surface answer source + echo userId for debugging
+  if (data && typeof data === "object") {
+    if (upstreamAnswerSource && data.answerSource == null) {
       data.answerSource = upstreamAnswerSource;
     }
+    // include what FastAPI says it received
+    data.echoUserId = upstreamEchoUserId || null;
+    // also include whether we attached a userId from JWT/override
+    data.attachedUserId = userId || null;
   }
+
+  // Pass through helpful headers
+  if (upstreamAnswerSource) res.setHeader("X-Answer-Source", upstreamAnswerSource);
+  if (upstreamEchoUserId)   res.setHeader("X-Echo-UserId", upstreamEchoUserId);
 
   // Echo tracing id back
   res.setHeader("X-Request-Id", upstreamReqId);
@@ -162,6 +183,7 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     attempts: attempt,
     answerSource: upstreamAnswerSource ?? null,
     hasUserId: Boolean(userId),
+    echoUserId: upstreamEchoUserId || null,
   });
 
   return res.status(passthroughStatus).json({ ...data, requestId: upstreamReqId });

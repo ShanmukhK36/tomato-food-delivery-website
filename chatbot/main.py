@@ -25,7 +25,6 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tomatoai")
 
-# Environment (tolerant so import never crashes)
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT  = float(os.getenv("OPENAI_TIMEOUT", "10"))
@@ -169,48 +168,32 @@ def explain_stripe_error(text: str) -> str:
     t = (text or "")
     low = t.lower()
 
-    found_types = []
-    found_codes = []
-    found_declines = []
-    found_statuses = []
+    found_types, found_codes, found_declines, found_statuses = [], [], [], []
 
     for k in STRIPE_ERRORS["types"]:
-        if k in low:
-            found_types.append(k)
+        if k in low: found_types.append(k)
     for k in STRIPE_ERRORS["codes"]:
-        if k in low:
-            found_codes.append(k)
+        if k in low: found_codes.append(k)
     for k in STRIPE_ERRORS["decline_codes"]:
-        if k in low:
-            found_declines.append(k)
+        if k in low: found_declines.append(k)
     for k in STRIPE_ERRORS["intents"]:
-        if k in low:
-            found_statuses.append(k)
+        if k in low: found_statuses.append(k)
 
     for m in re.finditer(r'(type|code|decline_code)\s*["\':]\s*["\']?([a-zA-Z0-9_\-]+)', t):
-        field = _n(m.group(1))
-        val = _n(m.group(2))
-        if field == "type" and val in STRIPE_ERRORS["types"] and val not in found_types:
-            found_types.append(val)
-        elif field == "code" and val in STRIPE_ERRORS["codes"] and val not in found_codes:
-            found_codes.append(val)
-        elif field == "decline_code" and val in STRIPE_ERRORS["decline_codes"] and val not in found_declines:
-            found_declines.append(val)
+        field = _n(m.group(1)); val = _n(m.group(2))
+        if field == "type" and val in STRIPE_ERRORS["types"] and val not in found_types: found_types.append(val)
+        elif field == "code" and val in STRIPE_ERRORS["codes"] and val not in found_codes: found_codes.append(val)
+        elif field == "decline_code" and val in STRIPE_ERRORS["decline_codes"] and val not in found_declines: found_declines.append(val)
 
     lines: List[str] = []
-
     if ("card_declined" in found_codes or "card_error" in found_types) and found_declines:
-        dc = found_declines[0]
-        lines.append(f"Stripe says **card_declined / {dc}** — {STRIPE_ERRORS['decline_codes'][dc]}")
+        dc = found_declines[0]; lines.append(f"Stripe says **card_declined / {dc}** — {STRIPE_ERRORS['decline_codes'][dc]}")
     if found_codes and not lines:
-        c = found_codes[0]
-        lines.append(f"Stripe **{c}** — {STRIPE_ERRORS['codes'][c]}")
+        c = found_codes[0]; lines.append(f"Stripe **{c}** — {STRIPE_ERRORS['codes'][c]}")
     if found_types and not lines:
-        ty = found_types[0]
-        lines.append(f"Stripe **{ty}** — {STRIPE_ERRORS['types'][ty]}")
+        ty = found_types[0]; lines.append(f"Stripe **{ty}** — {STRIPE_ERRORS['types'][ty]}")
     if found_statuses:
-        st = found_statuses[0]
-        lines.append(f"Status **{st}** — {STRIPE_ERRORS['intents'][st]}")
+        st = found_statuses[0]; lines.append(f"Status **{st}** — {STRIPE_ERRORS['intents'][st]}")
 
     if not lines:
         lines = [
@@ -221,12 +204,9 @@ def explain_stripe_error(text: str) -> str:
             "• **invalid_request_error** → missing/wrong params; check IDs, currency, amounts.",
             "• **rate_limit_error** → back off and retry.",
         ]
-
     lines.append("Next steps: confirm the exact error fields, retry only idempotently, or collect a new payment method / contact bank if it’s a decline.")
     reply = " ".join(lines)
-    if len(reply) > 900:
-        reply = reply[:900].rstrip() + "…"
-    return reply
+    return (reply[:900].rstrip() + "…") if len(reply) > 900 else reply
 
 # ---------------- Seed Data (normalized) ----------------
 STATIC_FOODS = [
@@ -339,6 +319,7 @@ def _names_for(cat: str, limit: int = 20) -> List[str]:
     items = _items_for(cat, limit)
     return [it["name"] for it in items]
 
+# ---- User/Orders helpers ----
 def _possible_user_id_filters(user_id: str):
     """
     Build a robust $or filter that matches either string or ObjectId
@@ -538,7 +519,6 @@ def llm_compose(system_prompt: str, content: str) -> str:
         out = (r.choices[0].message.content or "").strip()
         if not out:
             return content
-        # Optional: log usage to monitor costs
         usage = getattr(r, "usage", None)
         if usage:
             log.info("openai tokens prompt=%s completion=%s total=%s",
@@ -568,7 +548,6 @@ def build_context(user_msg: str, user_id: Optional[str]) -> str:
     popular = take(get_popular_items(), MAX_POPULAR)
     recent = take(get_user_recent_orders(user_id), MAX_RECENT)
 
-    # Enriched category lines with prices
     sandwiches = _items_for("sandwich", MAX_POPULAR)
     rolls      = _items_for("rolls", MAX_POPULAR)
     veg        = _items_for("veg", MAX_POPULAR)
@@ -612,7 +591,7 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.6.2")
+app = FastAPI(title="Tomato Chatbot API", version="1.6.3")
 
 @app.on_event("startup")
 def _seed_on_startup():
@@ -685,9 +664,17 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.6.2",
+        "version": "1.6.3",
         "force_llm": FORCE_LLM,
     }
+
+# Helper: quick echo to confirm what we received and the built filter
+@app.post("/whoami")
+def whoami(req: ChatReq, x_service_auth: str = Header(default="")):
+    if not safe_eq(x_service_auth, SHARED_SECRET):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    flt = _possible_user_id_filters(req.userId or "")
+    return {"received_userId": req.userId or None, "filter": flt}
 
 # ---------------- Chat ----------------
 @app.post("/chat", response_model=ChatResp)
@@ -703,11 +690,9 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
     user_id = req.userId or None
     req_id = getattr(request.state, "req_id", "n/a")
 
-    # For quick debugging in browser devtools
+    # Echo userId for easy debugging in Network panel
     if response is not None:
-        response.headers["X-UserId-Received"] = "1" if (user_id is not None) else "0"
-        if user_id:
-            response.headers["X-UserId"] = str(user_id)
+        response.headers["X-Echo-UserId"] = str(user_id or "")
 
     # ---- Stripe errors branch (DB/LLM not needed) ----
     if is_stripe_query(user_msg):
@@ -813,7 +798,6 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
         answer = (completion.choices[0].message.content or "").strip()
         if response is not None:
             response.headers["X-Answer-Source"] = "llm"
-        # Optional: log usage
         usage = getattr(completion, "usage", None)
         if usage:
             log.info("openai tokens prompt=%s completion=%s total=%s",
