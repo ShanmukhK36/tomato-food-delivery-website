@@ -1,8 +1,9 @@
 import { useContext, useEffect, useRef, useState } from "react";
-import { StoreContext } from '../context/StoreContext';
+import { StoreContext } from "../context/StoreContext";
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 const getUserId = () => localStorage.getItem("userId") || "guest";
+const getToken = () => localStorage.getItem("token") || "";
 const keyFor = (userId) => `tomatoai:${userId}:messages`;
 
 const ChatbotWidget = () => {
@@ -21,7 +22,15 @@ const ChatbotWidget = () => {
     const cached = localStorage.getItem(keyFor(u));
     return cached
       ? JSON.parse(cached)
-      : [{ id: uid(), role: "assistant", content: "Hi! I’m TomatoAI. Ask me about restaurants, dishes, delivery status, or your orders.", ts: Date.now() }];
+      : [
+          {
+            id: uid(),
+            role: "assistant",
+            content:
+              "Hi! I’m TomatoAI. Ask me about restaurants, dishes, delivery status, or your orders.",
+            ts: Date.now(),
+          },
+        ];
   });
 
   const controllerRef = useRef(null);
@@ -34,10 +43,12 @@ const ChatbotWidget = () => {
       const current = getUserId();
       setUserId((prev) => (prev !== current ? current : prev));
     };
-    const onStorage = (e) => { if (!e || e.key === "userId") sync(); };
+    const onStorage = (e) => {
+      if (!e || e.key === "userId" || e.key === "token") sync();
+    };
     window.addEventListener("storage", onStorage);
     window.addEventListener("focus", sync);
-    const timer = setInterval(sync, 1000); // tiny safety net for same-tab updates
+    const timer = setInterval(sync, 1000); // safety net for same-tab updates
     return () => {
       window.removeEventListener("storage", onStorage);
       window.removeEventListener("focus", sync);
@@ -51,7 +62,15 @@ const ChatbotWidget = () => {
     setMessages(
       cached
         ? JSON.parse(cached)
-        : [{ id: uid(), role: "assistant", content: "Hi! I’m TomatoAI. Ask me about restaurants, dishes, delivery status, or your orders.", ts: Date.now() }]
+        : [
+            {
+              id: uid(),
+              role: "assistant",
+              content:
+                "Hi! I’m TomatoAI. Ask me about restaurants, dishes, delivery status, or your orders.",
+              ts: Date.now(),
+            },
+          ]
     );
   }, [userId]);
 
@@ -75,8 +94,9 @@ const ChatbotWidget = () => {
     const text = input.trim();
     if (!text || loading) return;
 
-    // always read the freshest userId right before sending
+    // always read the freshest ids right before sending
     const currentUserId = getUserId();
+    const token = getToken();
     if (currentUserId !== userId) setUserId(currentUserId);
 
     // cancel any in-flight request
@@ -91,14 +111,30 @@ const ChatbotWidget = () => {
 
     const tryFetch = async (attempt = 1) => {
       try {
+        // Build headers: JWT if available; otherwise dev override header
+        const headers = { "Content-Type": "application/json" };
+        if (token) {
+          headers.Authorization = `Bearer ${token}`;
+        } else if (currentUserId && currentUserId !== "guest") {
+          headers["X-Debug-UserId"] = currentUserId;
+        }
+
         const res = await fetch(url + "/api/chat", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: text, userId: currentUserId }),
-          signal: ac.signal
+          headers,
+          // IMPORTANT: don't send userId in body — backend derives it from JWT
+          body: JSON.stringify({ message: text }),
+          signal: ac.signal,
         });
 
-        const data = await res.json().catch(() => ({}));
+        // Parse JSON safely even on errors
+        let data = {};
+        try {
+          data = await res.json();
+        } catch {
+          data = {};
+        }
+
         if (!res.ok) {
           const rid = data?.requestId ? ` · id=${data.requestId}` : "";
           throw new Error((data?.error || `HTTP ${res.status}`) + rid);
@@ -108,7 +144,7 @@ const ChatbotWidget = () => {
           id: uid(),
           role: "assistant",
           content: typeof data.reply === "string" ? data.reply : "...",
-          ts: Date.now()
+          ts: Date.now(),
         };
         setMessages((m) => [...m, botMsg]);
       } catch (err) {
@@ -123,11 +159,11 @@ const ChatbotWidget = () => {
           {
             id: uid(),
             role: "assistant",
-            content: `Sorry — ${String(err.message || 'request failed')}.`,
+            content: `Sorry — ${String(err.message || "request failed")}.`,
             ts: Date.now(),
             error: true,
-            retryPayload: { text }
-          }
+            retryPayload: { text },
+          },
         ]);
       } finally {
         if (!ac.signal.aborted) setLoading(false);
@@ -171,7 +207,9 @@ const ChatbotWidget = () => {
         >
           {/* Header */}
           <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
-            <div id="tomatoai-title" className="font-semibold">TomatoAI</div>
+            <div id="tomatoai-title" className="font-semibold">
+              TomatoAI
+            </div>
             <button
               onClick={() => setOpen(false)}
               className="text-gray-500 hover:text-gray-700"
@@ -189,15 +227,23 @@ const ChatbotWidget = () => {
             aria-relevant="additions"
           >
             {messages.map((m) => (
-              <div key={m.id} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
+              <div
+                key={m.id}
+                className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
+              >
                 <div
                   className={`max-w-[80%] rounded-2xl px-3 py-2 text-sm ${
-                    m.role === "user" ? "bg-orange-500 text-white" : "bg-gray-100 text-gray-900"
+                    m.role === "user"
+                      ? "bg-orange-500 text-white"
+                      : "bg-gray-100 text-gray-900"
                   }`}
                 >
                   <p className="whitespace-pre-wrap break-words">{m.content}</p>
                   <span className="mt-1 block text-[10px] opacity-70">
-                    {new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                    {new Date(m.ts).toLocaleTimeString([], {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })}
                     {m.error && (
                       <>
                         {" · "}
@@ -214,7 +260,11 @@ const ChatbotWidget = () => {
                 </div>
               </div>
             ))}
-            {loading && <div className="text-xs text-gray-500 italic px-2">TomatoAI is typing…</div>}
+            {loading && (
+              <div className="text-xs text-gray-500 italic px-2">
+                TomatoAI is typing…
+              </div>
+            )}
             <div ref={endRef} />
           </div>
 

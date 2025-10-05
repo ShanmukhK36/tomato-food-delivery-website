@@ -8,6 +8,7 @@ from itertools import islice
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
@@ -37,6 +38,11 @@ DB_NAME         = os.getenv("DB_NAME", "food-delivery")
 
 USE_MEMORY      = os.getenv("USE_MEMORY", "0") == "1"  # default off on Vercel
 FORCE_LLM       = os.getenv("FORCE_LLM", "0") == "1"   # optional: let LLM rewrite deterministic drafts
+
+# Optional: lock CORS to specific origins in prod
+FRONTEND_ORIGINS = [o.strip() for o in (os.getenv("ALLOWED_ORIGINS") or "").split(",") if o.strip()]
+if not FRONTEND_ORIGINS:
+    FRONTEND_ORIGINS = ["*"]  # dev-friendly; set ALLOWED_ORIGINS in prod
 
 # OpenAI client (safe init; do NOT crash if missing/misconfigured)
 client = None
@@ -301,7 +307,6 @@ def _fmt_price(p):
     if p is None:
         return ""
     try:
-        # show $12 or $12.5 cleanly
         if float(p).is_integer():
             return f"${int(float(p))}"
         return f"${float(p)}"
@@ -323,18 +328,29 @@ def _names_for(cat: str, limit: int = 20) -> List[str]:
 def _possible_user_id_filters(user_id: str):
     """
     Build a robust $or filter that matches either string or ObjectId
-    across common field spellings: 'user_id' and 'userId'.
+    across common field spellings (user_id, userId) and also `user` reference.
     """
     if not user_id:
         return None
-    or_terms = [{"user_id": user_id}, {"userId": user_id}]
+
+    candidates = [{"user_id": user_id}, {"userId": user_id}, {"user": user_id}]
     if ObjectId:
         try:
             oid = ObjectId(user_id)
-            or_terms.extend([{"user_id": oid}, {"userId": oid}])
+            candidates.extend([{"user_id": oid}, {"userId": oid}, {"user": oid}])
         except Exception:
             pass
-    return {"$or": or_terms}
+
+    # If some docs nested e.g. {"user": {"id": "..."}}
+    candidates.extend([{"user.id": user_id}, {"user._id": user_id}])
+    if ObjectId:
+        try:
+            oid = ObjectId(user_id)
+            candidates.extend([{"user.id": oid}, {"user._id": oid}])
+        except Exception:
+            pass
+
+    return {"$or": candidates}
 
 def get_popular_items(limit=MAX_POPULAR) -> List[str]:
     if db is None:
@@ -349,7 +365,7 @@ def get_popular_items(limit=MAX_POPULAR) -> List[str]:
 def get_user_recent_orders(user_id: Optional[str], limit=MAX_RECENT) -> List[str]:
     """
     Robustly fetch recent orders for a user, matching both string and ObjectId
-    in both 'user_id' and 'userId' fields.
+    in 'user_id', 'userId', 'user' and simple nested user.id / user._id fields.
     """
     if db is None or not user_id or user_id == "guest":
         return []
@@ -359,11 +375,18 @@ def get_user_recent_orders(user_id: Optional[str], limit=MAX_RECENT) -> List[str
             return []
         cur = (
             db["orders"]
-            .find(flt, {"order_id": 1})
+            .find(flt, {"order_id": 1, "_id": 1})
             .sort("order_date", -1)
             .limit(limit)
         )
-        return [str(doc.get("order_id")) for doc in cur if doc.get("order_id") is not None]
+        out: List[str] = []
+        for doc in cur:
+            oid = doc.get("order_id")
+            if oid is None:
+                oid = doc.get("_id")
+            if oid is not None:
+                out.append(str(oid))
+        return out
     except PyMongoError:
         log.exception("get_user_recent_orders failed")
         return []
@@ -591,7 +614,16 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.6.3")
+app = FastAPI(title="Tomato Chatbot API", version="1.6.4")
+
+# CORS (for direct browser ↔ FastAPI testing; Node-to-Python calls ignore CORS)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=FRONTEND_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.on_event("startup")
 def _seed_on_startup():
@@ -664,7 +696,7 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.6.3",
+        "version": "1.6.4",
         "force_llm": FORCE_LLM,
     }
 
@@ -714,11 +746,13 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             text = "Your recent orders: " + ", ".join(orders) + ". Want details for one of them?"
             if response is not None:
                 response.headers["X-Answer-Source"] = "rule:orders_list"
+                response.headers["X-Orders-Count"] = str(len(orders))
             return ChatResp(reply=text)
         else:
             text = "I couldn’t find past orders for your account yet. You can place an order and I’ll track it here."
             if response is not None:
                 response.headers["X-Answer-Source"] = "rule:orders_none"
+                response.headers["X-Orders-Count"] = "0"
             return ChatResp(reply=text)
 
     # ---- Popularity questions: answer from DB; optionally let LLM compose ----

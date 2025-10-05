@@ -11,6 +11,32 @@ const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS ?? 8000);
 const MAX_MESSAGE_LEN = Number(process.env.MAX_MESSAGE_LEN ?? 2000);
 const MAX_RETRIES = Number(process.env.UPSTREAM_RETRIES ?? 2); // total attempts
 
+// ---------- CORS (allow your web app origin) ----------
+const FRONTEND_URL =
+  process.env.FRONTEND_URL ||
+  "https://tomato-food-delivery-website-umber.vercel.app";
+
+router.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && origin === FRONTEND_URL) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+  // vary for caches/CDN
+  res.setHeader("Vary", "Origin");
+
+  // allow auth and AJAX
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Requested-With"
+  );
+
+  // quick end for preflight
+  if (req.method === "OPTIONS") return res.status(204).end();
+  next();
+});
+
 // ---------- helpers ----------
 function validateBody(body) {
   if (!body || typeof body.message !== "string") return "message must be a string";
@@ -72,8 +98,9 @@ function getUserIdFromRequest(req) {
   // 2) Dev override (only when no valid JWT): header or query param
   const debugHeader = req.headers["x-debug-userid"];
   const debugQuery = req.query?.debug_user_id;
-  const override = (typeof debugHeader === "string" && debugHeader.trim()) ||
-                   (typeof debugQuery === "string" && debugQuery.trim());
+  const override =
+    (typeof debugHeader === "string" && debugHeader.trim()) ||
+    (typeof debugQuery === "string" && debugQuery.trim());
   return override || null;
 }
 
@@ -100,12 +127,13 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     headers: {
       "Content-Type": "application/json",
       "x-service-auth": SHARED_SECRET, // must match Python SHARED_SECRET
-      "x-request-id": reqId,           // pass through for tracing
+      "x-request-id": reqId, // pass through for tracing
     },
     body: JSON.stringify(upstreamBody),
   });
 
-  const tryOnce = async () => fetchWithTimeout(PY_CHAT_URL, buildInit(), UPSTREAM_TIMEOUT_MS);
+  const tryOnce = async () =>
+    fetchWithTimeout(PY_CHAT_URL, buildInit(), UPSTREAM_TIMEOUT_MS);
 
   let upstreamRes;
   let attempt = 0;
@@ -129,7 +157,12 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
   }
 
   if (!upstreamRes) {
-    logJSON("error", { reqId, route: "/api/chat", msg: "no upstream response", error: String(lastErr) });
+    logJSON("error", {
+      reqId,
+      route: "/api/chat",
+      msg: "no upstream response",
+      error: String(lastErr),
+    });
     return res.status(502).json({ error: "Chat service unavailable", requestId: reqId });
   }
 
@@ -160,10 +193,8 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     if (upstreamAnswerSource && data.answerSource == null) {
       data.answerSource = upstreamAnswerSource;
     }
-    // include what FastAPI says it received
-    data.echoUserId = upstreamEchoUserId || null;
-    // also include whether we attached a userId from JWT/override
-    data.attachedUserId = userId || null;
+    data.echoUserId = upstreamEchoUserId || null; // what FastAPI received
+    data.attachedUserId = userId || null;        // what we attached
   }
 
   // Pass through helpful headers
