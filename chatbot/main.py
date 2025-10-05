@@ -3,7 +3,7 @@ import re
 import hmac
 import logging
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
 from itertools import islice
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
@@ -364,8 +364,7 @@ def get_popular_items(limit=MAX_POPULAR) -> List[str]:
 
 def get_user_recent_orders(user_id: Optional[str], limit=MAX_RECENT) -> List[str]:
     """
-    Robustly fetch recent orders for a user, matching both string and ObjectId
-    in 'user_id', 'userId', 'user' and simple nested user.id / user._id fields.
+    Legacy helper (kept): returns recent order ids only.
     """
     if db is None or not user_id or user_id == "guest":
         return []
@@ -381,14 +380,76 @@ def get_user_recent_orders(user_id: Optional[str], limit=MAX_RECENT) -> List[str
         )
         out: List[str] = []
         for doc in cur:
-            oid = doc.get("order_id")
-            if oid is None:
-                oid = doc.get("_id")
+            oid = doc.get("order_id", doc.get("_id"))
             if oid is not None:
                 out.append(str(oid))
         return out
     except PyMongoError:
         log.exception("get_user_recent_orders failed")
+        return []
+
+# --- Pretty recent-order formatting helpers ---
+def _short_id(oid):
+    s = str(oid or "")
+    return ("…" + s[-2:]) if len(s) > 2 else s
+
+def _fmt_date(d):
+    try:
+        if isinstance(d, str):
+            dt = datetime.fromisoformat(d.replace("Z", "+00:00"))
+        else:
+            dt = d
+        if not isinstance(dt, datetime):
+            return "unknown date"
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.strftime("%b %d")
+    except Exception:
+        return "unknown date"
+
+def _summarize_items(items, max_items=3):
+    parts = []
+    total_qty = 0
+    items = items or []
+    for it in items:
+        name = (it.get("name") or "").strip()
+        qty = int(it.get("qty") or 1)
+        total_qty += qty
+        if len(parts) < max_items and name:
+            parts.append(f"{name} ×{qty}")
+    more = max(0, len(items) - len(parts))
+    preview = ", ".join(parts) + (f", +{more} more" if more > 0 else "")
+    return total_qty, preview
+
+def get_user_recent_orders_detailed(user_id: Optional[str], limit=MAX_RECENT):
+    """
+    Fetch recent orders with date & items for a user.
+    Matches 'user_id' / 'userId' / 'user' and nested user ids (string or ObjectId).
+    Returns: [{order_id, order_date, items:[{name,qty},...]}, ...]
+    """
+    if db is None or not user_id or user_id == "guest":
+        return []
+    try:
+        flt = _possible_user_id_filters(user_id)
+        if not flt:
+            return []
+        cur = (
+            db["orders"]
+            .find(flt, {"order_id": 1, "_id": 1, "order_date": 1, "items": 1})
+            .sort("order_date", -1)
+            .limit(limit)
+        )
+        out = []
+        for doc in cur:
+            oid = doc.get("order_id", doc.get("_id"))
+            out.append({
+                "order_id": oid,
+                "order_date": doc.get("order_date"),
+                "items": doc.get("items") or []
+            })
+        return out
+    except Exception:
+        log.exception("get_user_recent_orders_detailed failed")
         return []
 
 # Category helpers
@@ -614,7 +675,7 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.6.4")
+app = FastAPI(title="Tomato Chatbot API", version="1.6.5")
 
 # CORS (for direct browser ↔ FastAPI testing; Node-to-Python calls ignore CORS)
 app.add_middleware(
@@ -696,7 +757,7 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.6.4",
+        "version": "1.6.5",
         "force_llm": FORCE_LLM,
     }
 
@@ -733,7 +794,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             response.headers["X-Answer-Source"] = "rule:stripe"
         return ChatResp(reply=reply)
 
-    # ---- Previous orders branch ----
+    # ---- Previous orders branch (DETAILED) ----
     if is_previous_orders_query(user_msg):
         if not user_id or user_id == "guest":
             text = "To show your past orders, please log in. Once you’re signed in, ask “show my recent orders.”"
@@ -741,19 +802,25 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                 response.headers["X-Answer-Source"] = "rule:orders_login_required"
             return ChatResp(reply=text)
 
-        orders = get_user_recent_orders(user_id, limit=MAX_RECENT)
-        if orders:
-            text = "Your recent orders: " + ", ".join(orders) + ". Want details for one of them?"
+        detailed = get_user_recent_orders_detailed(user_id, limit=MAX_RECENT)
+        if detailed:
+            lines = ["Your recent orders:"]
+            for o in detailed:
+                when = _fmt_date(o.get("order_date"))
+                total_qty, preview = _summarize_items(o.get("items"), max_items=3)
+                tail = f"(id {_short_id(o.get('order_id'))})" if o.get("order_id") is not None else ""
+                lines.append(f"• {when} — {total_qty} items: {preview} {tail}".rstrip())
+            text = "\n".join(lines)
             if response is not None:
-                response.headers["X-Answer-Source"] = "rule:orders_list"
-                response.headers["X-Orders-Count"] = str(len(orders))
+                response.headers["X-Answer-Source"] = "rule:orders_list_detailed"
+                response.headers["X-Orders-Count"] = str(len(detailed))
             return ChatResp(reply=text)
-        else:
-            text = "I couldn’t find past orders for your account yet. You can place an order and I’ll track it here."
-            if response is not None:
-                response.headers["X-Answer-Source"] = "rule:orders_none"
-                response.headers["X-Orders-Count"] = "0"
-            return ChatResp(reply=text)
+
+        text = "I couldn’t find past orders for your account yet. You can place an order and I’ll track it here."
+        if response is not None:
+            response.headers["X-Answer-Source"] = "rule:orders_none"
+            response.headers["X-Orders-Count"] = "0"
+        return ChatResp(reply=text)
 
     # ---- Popularity questions: answer from DB; optionally let LLM compose ----
     if is_popularity_query(user_msg):
