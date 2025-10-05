@@ -2,20 +2,23 @@ import { useContext, useEffect, useRef, useState } from "react";
 import { StoreContext } from '../context/StoreContext';
 
 const uid = () => Math.random().toString(36).slice(2, 10);
-const getCurrentUserId = () => localStorage.getItem("userId") || "guest";
+const getUserId = () => localStorage.getItem("userId") || "guest";
+const keyFor = (userId) => `tomatoai:${userId}:messages`;
 
 const ChatbotWidget = () => {
   const { url } = useContext(StoreContext);
+
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
 
-  // Track userId as state so changes in localStorage reflect here
-  const [userId, setUserId] = useState(getCurrentUserId());
+  // live user id that reacts to login/logout
+  const [userId, setUserId] = useState(getUserId());
 
+  // message thread per user
   const [messages, setMessages] = useState(() => {
-    const uidNow = getCurrentUserId();
-    const cached = localStorage.getItem(`tomatoai:${uidNow}:messages`);
+    const u = getUserId();
+    const cached = localStorage.getItem(keyFor(u));
     return cached
       ? JSON.parse(cached)
       : [{ id: uid(), role: "assistant", content: "Hi! I’m TomatoAI. Ask me about restaurants, dishes, delivery status, or your orders.", ts: Date.now() }];
@@ -25,24 +28,26 @@ const ChatbotWidget = () => {
   const inputRef = useRef(null);
   const endRef = useRef(null);
 
-  // Keep userId in sync with localStorage (login/logout elsewhere)
+  // keep userId synced with localStorage (login/logout)
   useEffect(() => {
     const sync = () => {
-      const uidNow = getCurrentUserId();
-      setUserId((prev) => (prev !== uidNow ? uidNow : prev));
+      const current = getUserId();
+      setUserId((prev) => (prev !== current ? current : prev));
     };
-    // storage fires when other tabs update; also check on focus
-    window.addEventListener("storage", sync);
+    const onStorage = (e) => { if (!e || e.key === "userId") sync(); };
+    window.addEventListener("storage", onStorage);
     window.addEventListener("focus", sync);
+    const timer = setInterval(sync, 1000); // tiny safety net for same-tab updates
     return () => {
-      window.removeEventListener("storage", sync);
+      window.removeEventListener("storage", onStorage);
       window.removeEventListener("focus", sync);
+      clearInterval(timer);
     };
   }, []);
 
-  // When userId changes, load that user's cached messages (or greeting)
+  // when userId changes, load that user's cached thread (or greeting)
   useEffect(() => {
-    const cached = localStorage.getItem(`tomatoai:${userId}:messages`);
+    const cached = localStorage.getItem(keyFor(userId));
     setMessages(
       cached
         ? JSON.parse(cached)
@@ -50,17 +55,17 @@ const ChatbotWidget = () => {
     );
   }, [userId]);
 
-  // Persist messages per current user
+  // persist messages per-user
   useEffect(() => {
-    localStorage.setItem(`tomatoai:${userId}:messages`, JSON.stringify(messages));
+    localStorage.setItem(keyFor(userId), JSON.stringify(messages));
   }, [messages, userId]);
 
-  // Scroll to bottom on open/new messages
+  // autoscroll
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, open]);
 
-  // Focus input when opening
+  // focus input on open
   useEffect(() => {
     if (open) setTimeout(() => inputRef.current?.focus(), 0);
   }, [open]);
@@ -70,11 +75,11 @@ const ChatbotWidget = () => {
     const text = input.trim();
     if (!text || loading) return;
 
-    // Always read the latest userId before sending
-    const currentUserId = getCurrentUserId();
+    // always read the freshest userId right before sending
+    const currentUserId = getUserId();
     if (currentUserId !== userId) setUserId(currentUserId);
 
-    // Abort any in-flight request
+    // cancel any in-flight request
     controllerRef.current?.abort?.();
     const ac = new AbortController();
     controllerRef.current = ac;
@@ -89,19 +94,16 @@ const ChatbotWidget = () => {
         const res = await fetch(url + "/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: text, userId: currentUserId }), // <-- send fresh userId
+          body: JSON.stringify({ message: text, userId: currentUserId }),
           signal: ac.signal
         });
+
+        const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          let msg = `HTTP ${res.status}`;
-          try {
-            const err = await res.json();
-            if (err?.error) msg = err.error;
-            if (err?.requestId) msg += ` · id=${err.requestId}`;
-          } catch {}
-          throw new Error(msg);
+          const rid = data?.requestId ? ` · id=${data.requestId}` : "";
+          throw new Error((data?.error || `HTTP ${res.status}`) + rid);
         }
-        const data = await res.json(); // { reply }
+
         const botMsg = {
           id: uid(),
           role: "assistant",
