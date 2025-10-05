@@ -15,7 +15,6 @@ from pymongo.errors import PyMongoError
 from openai import OpenAI, APIConnectionError, RateLimitError, APIStatusError
 from dotenv import load_dotenv
 
-# Try to import ObjectId safely (so local dev without bson won't crash import)
 try:
     from bson import ObjectId
 except Exception:
@@ -36,15 +35,14 @@ SHARED_SECRET   = os.getenv("SHARED_SECRET", "dev-secret")
 MONGO_URI       = os.getenv("MONGO_URI")
 DB_NAME         = os.getenv("DB_NAME", "food-delivery")
 
-USE_MEMORY      = os.getenv("USE_MEMORY", "0") == "1"  # default off on Vercel
-FORCE_LLM       = os.getenv("FORCE_LLM", "0") == "1"   # optional: let LLM rewrite deterministic drafts
+USE_MEMORY      = os.getenv("USE_MEMORY", "0") == "1"
+FORCE_LLM       = os.getenv("FORCE_LLM", "0") == "1"
 
-# Optional: lock CORS to specific origins in prod
 FRONTEND_ORIGINS = [o.strip() for o in (os.getenv("ALLOWED_ORIGINS") or "").split(",") if o.strip()]
 if not FRONTEND_ORIGINS:
-    FRONTEND_ORIGINS = ["*"]  # dev-friendly; set ALLOWED_ORIGINS in prod
+    FRONTEND_ORIGINS = ["*"]
 
-# OpenAI client (safe init; do NOT crash if missing/misconfigured)
+# OpenAI client (safe init)
 client = None
 if OPENAI_API_KEY:
     try:
@@ -92,7 +90,6 @@ POPULARITY_START  = 50
 
 # ---------------- Stripe error knowledge ----------------
 def _n(s: str) -> str:
-    """normalize key: lower + replace spaces/dashes with underscores"""
     return (s or "").strip().lower().replace("-", "_").replace(" ", "_")
 
 STRIPE_ERRORS = {
@@ -173,7 +170,6 @@ def is_stripe_query(text: str) -> bool:
 def explain_stripe_error(text: str) -> str:
     t = (text or "")
     low = t.lower()
-
     found_types, found_codes, found_declines, found_statuses = [], [], [], []
 
     for k in STRIPE_ERRORS["types"]:
@@ -214,7 +210,7 @@ def explain_stripe_error(text: str) -> str:
     reply = " ".join(lines)
     return (reply[:900].rstrip() + "…") if len(reply) > 900 else reply
 
-# ---------------- Seed Data (normalized) ----------------
+# ---------------- Seed Data ----------------
 STATIC_FOODS = [
     {"name": "Greek salad", "category": "salad", "price": 12},
     {"name": "Veg salad", "category": "salad", "price": 18},
@@ -251,7 +247,6 @@ STATIC_FOODS = [
 ]
 
 def bootstrap_foods_if_empty():
-    """Upsert a small menu so DB answers work immediately."""
     if db is None:
         return
     try:
@@ -286,7 +281,22 @@ def trim_text(s: str, n: int) -> str:
 def take(iterable, n):
     return list(islice(iterable, n))
 
-# New: richer item fetch with price & category (used in context and some replies)
+def to_safe_dt(v):
+    """Parse Mongo Date or ISO string to aware datetime; else None."""
+    if isinstance(v, datetime):
+        dt = v
+    elif isinstance(v, str):
+        try:
+            dt = datetime.fromisoformat(v.strip().replace("Z", "+00:00"))
+        except Exception:
+            return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+# menu helpers
 def _items_for(cat: str, limit: int = 20):
     if db is None:
         return []
@@ -319,20 +329,14 @@ def _fmt_items(items):
         for it in items if it.get("name")
     )
 
-# Keep simple name-only helpers (backward compatibility)
 def _names_for(cat: str, limit: int = 20) -> List[str]:
     items = _items_for(cat, limit)
     return [it["name"] for it in items]
 
 # ---- User/Orders helpers ----
 def _possible_user_id_filters(user_id: str):
-    """
-    Build a robust $or filter that matches either string or ObjectId
-    across common field spellings (user_id, userId) and also `user` reference.
-    """
     if not user_id:
         return None
-
     candidates = [{"user_id": user_id}, {"userId": user_id}, {"user": user_id}]
     if ObjectId:
         try:
@@ -340,8 +344,6 @@ def _possible_user_id_filters(user_id: str):
             candidates.extend([{"user_id": oid}, {"userId": oid}, {"user": oid}])
         except Exception:
             pass
-
-    # If some docs nested e.g. {"user": {"id": "..."}}
     candidates.extend([{"user.id": user_id}, {"user._id": user_id}])
     if ObjectId:
         try:
@@ -349,7 +351,6 @@ def _possible_user_id_filters(user_id: str):
             candidates.extend([{"user.id": oid}, {"user._id": oid}])
         except Exception:
             pass
-
     return {"$or": candidates}
 
 def get_popular_items(limit=MAX_POPULAR) -> List[str]:
@@ -363,9 +364,6 @@ def get_popular_items(limit=MAX_POPULAR) -> List[str]:
         return []
 
 def get_user_recent_orders(user_id: Optional[str], limit=MAX_RECENT) -> List[str]:
-    """
-    Legacy helper (kept): returns recent order ids only.
-    """
     if db is None or not user_id or user_id == "guest":
         return []
     try:
@@ -394,18 +392,8 @@ def _short_id(oid):
     return ("…" + s[-2:]) if len(s) > 2 else s
 
 def _fmt_date(d):
-    try:
-        if isinstance(d, str):
-            dt = datetime.fromisoformat(d.replace("Z", "+00:00"))
-        else:
-            dt = d
-        if not isinstance(dt, datetime):
-            return "unknown date"
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.strftime("%b %d")
-    except Exception:
-        return "unknown date"
+    dt = to_safe_dt(d)
+    return dt.strftime("%b %d, %Y") if dt else "unknown date"
 
 def _summarize_items(items, max_items=3):
     parts = []
@@ -423,9 +411,9 @@ def _summarize_items(items, max_items=3):
 
 def get_user_recent_orders_detailed(user_id: Optional[str], limit=MAX_RECENT):
     """
-    Fetch recent orders with date & items for a user.
-    Matches 'user_id' / 'userId' / 'user' and nested user ids (string or ObjectId).
-    Returns: [{order_id, order_date, items:[{name,qty},...]}, ...]
+    Fetch recent orders with normalized datetime `dt` chosen from:
+    date | order_date | created_at. Sorted by dt desc.
+    Returns: [{order_id, dt, items:[{name,qty},...], amount, status}, ...]
     """
     if db is None or not user_id or user_id == "guest":
         return []
@@ -433,19 +421,36 @@ def get_user_recent_orders_detailed(user_id: Optional[str], limit=MAX_RECENT):
         flt = _possible_user_id_filters(user_id)
         if not flt:
             return []
-        cur = (
-            db["orders"]
-            .find(flt, {"order_id": 1, "_id": 1, "order_date": 1, "items": 1})
-            .sort("order_date", -1)
-            .limit(limit)
-        )
+        pipeline = [
+            {"$match": flt},
+            {
+                "$project": {
+                    "_id": 1,
+                    "order_id": 1,
+                    "items": {"$ifNull": ["$items", []]},
+                    "amount": 1,
+                    "status": 1,
+                    # pick first non-null timestamp
+                    "dt": {
+                        "$ifNull": [
+                            "$date",
+                            {"$ifNull": ["$order_date", "$created_at"]},
+                        ]
+                    },
+                }
+            },
+            {"$sort": {"dt": -1, "_id": -1}},
+            {"$limit": int(limit)},
+        ]
+        docs = list(db["orders"].aggregate(pipeline))
         out = []
-        for doc in cur:
-            oid = doc.get("order_id", doc.get("_id"))
+        for d in docs:
             out.append({
-                "order_id": oid,
-                "order_date": doc.get("order_date"),
-                "items": doc.get("items") or []
+                "order_id": d.get("order_id", d.get("_id")),
+                "dt": d.get("dt"),
+                "items": d.get("items") or [],
+                "amount": d.get("amount"),
+                "status": d.get("status"),
             })
         return out
     except Exception:
@@ -462,7 +467,6 @@ def get_pasta_names(limit=20):    return _names_for("pasta", limit)
 def get_noodles_names(limit=20):  return _names_for("noodles", limit)
 def get_veg_names(limit=20):      return _names_for("veg", limit)
 
-# Map query text to a canonical category
 SYNONYMS = {
     "sub": "sandwich", "subs": "sandwich", "hoagie": "sandwich",
     "wrap": "rolls", "wraps": "rolls",
@@ -584,10 +588,6 @@ SYSTEM_PROMPT = (
 )
 
 def llm_compose(system_prompt: str, content: str) -> str:
-    """
-    Ask the model to rewrite/compose a reply using our system rules.
-    Falls back to the given content on errors or if client is unavailable.
-    """
     if client is None:
         return content
     try:
@@ -675,9 +675,8 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.6.5")
+app = FastAPI(title="Tomato Chatbot API", version="1.6.6")
 
-# CORS (for direct browser ↔ FastAPI testing; Node-to-Python calls ignore CORS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=FRONTEND_ORIGINS,
@@ -690,7 +689,6 @@ app.add_middleware(
 def _seed_on_startup():
     bootstrap_foods_if_empty()
 
-# Middleware adds x-request-id and prevents raw 500s from leaking
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
     req_id = request.headers.get("x-request-id") or os.urandom(8).hex()
@@ -707,7 +705,6 @@ async def add_request_id(request: Request, call_next):
     response.headers["x-request-id"] = req_id
     return response
 
-# Friendly root + route lister
 @app.get("/")
 def root():
     return {"ok": True, "service": "Tomato Chatbot API", "routes": [r.path for r in app.routes]}
@@ -757,11 +754,10 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.6.5",
+        "version": "1.6.6",
         "force_llm": FORCE_LLM,
     }
 
-# Helper: quick echo to confirm what we received and the built filter
 @app.post("/whoami")
 def whoami(req: ChatReq, x_service_auth: str = Header(default="")):
     if not safe_eq(x_service_auth, SHARED_SECRET):
@@ -772,7 +768,6 @@ def whoami(req: ChatReq, x_service_auth: str = Header(default="")):
 # ---------------- Chat ----------------
 @app.post("/chat", response_model=ChatResp)
 async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: Request = None, response: Response = None):
-    # Auth
     if not safe_eq(x_service_auth, SHARED_SECRET):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -783,18 +778,16 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
     user_id = req.userId or None
     req_id = getattr(request.state, "req_id", "n/a")
 
-    # Echo userId for easy debugging in Network panel
     if response is not None:
         response.headers["X-Echo-UserId"] = str(user_id or "")
 
-    # ---- Stripe errors branch (DB/LLM not needed) ----
     if is_stripe_query(user_msg):
         reply = explain_stripe_error(user_msg)
         if response is not None:
             response.headers["X-Answer-Source"] = "rule:stripe"
         return ChatResp(reply=reply)
 
-    # ---- Previous orders branch (DETAILED) ----
+    # ---- Previous orders (DETAILED with normalized date) ----
     if is_previous_orders_query(user_msg):
         if not user_id or user_id == "guest":
             text = "To show your past orders, please log in. Once you’re signed in, ask “show my recent orders.”"
@@ -806,7 +799,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
         if detailed:
             lines = ["Your recent orders:"]
             for o in detailed:
-                when = _fmt_date(o.get("order_date"))
+                when = _fmt_date(o.get("dt") or o.get("order_date") or o.get("date") or o.get("created_at"))
                 total_qty, preview = _summarize_items(o.get("items"), max_items=3)
                 tail = f"(id {_short_id(o.get('order_id'))})" if o.get("order_id") is not None else ""
                 lines.append(f"• {when} — {total_qty} items: {preview} {tail}".rstrip())
@@ -822,7 +815,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             response.headers["X-Orders-Count"] = "0"
         return ChatResp(reply=text)
 
-    # ---- Popularity questions: answer from DB; optionally let LLM compose ----
+    # ---- Popularity questions ----
     if is_popularity_query(user_msg):
         cat = category_from_query(user_msg)
         names = top_items_from_orders(limit=3, category=cat) or top_items_from_foods(limit=3, category=cat)
@@ -843,7 +836,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                     response.headers["X-Answer-Source"] = "rule:popularity"
             return ChatResp(reply=draft)
 
-    # ---- Category-first answers (no LLM needed to fetch; optionally LLM to compose) ----
+    # ---- Category-first answers ----
     cat = category_from_query(user_msg)
     if cat:
         fetch_map = {
@@ -885,7 +878,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             return ChatResp(reply="I’m temporarily offline. Popular dishes: " + ", ".join(popular[:10]) + ".")
         raise HTTPException(status_code=503, detail="Assistant temporarily unavailable")
 
-    # ---- Call OpenAI (primary LLM path) ----
+    # ---- Call OpenAI ----
     try:
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
