@@ -1,9 +1,8 @@
-import React from 'react'
 import { assets } from '../assets/assets'
 import { Link } from 'react-router-dom';
 
 const Footer = () => {
-    const admin_url = import.meta.env.ADMIN_URL;
+    const admin_url = import.meta.env.VITE_ADMIN_URL;
   return (
     <div className='text-[#d9d9d9] bg-[#323232] flex flex-col items-center gap-[20px] py-[20px] px-[8vw] pt-[80px] mt-10' id='contact'>
         <div className='w-full sm:grid grid-cols-[2fr_1fr_1fr] sm:gap-[80px]'>
