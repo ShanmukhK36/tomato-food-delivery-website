@@ -14,7 +14,7 @@ from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from openai import OpenAI, APIConnectionError, RateLimitError, APIStatusError
 from dotenv import load_dotenv
-from difflib import SequenceMatcher  # <-- NEW
+from difflib import SequenceMatcher  # fuzzy name match
 
 try:
     from bson import ObjectId
@@ -201,17 +201,12 @@ def explain_stripe_error(text: str) -> str:
     if not lines:
         lines = [
             "I can help with Stripe errors. If you paste the JSON (type / code / decline_code), I’ll decode it.",
-            "Common cases:",
-            "• **card_declined** → bank rejected charge (see decline_code like insufficient_funds, do_not_honor).",
-            "• **authentication_required** → present 3DS (next_action).",
-            "• **invalid_request_error** → missing/wrong params; check IDs, currency, amounts.",
-            "• **rate_limit_error** → back off and retry.",
         ]
     lines.append("Next steps: confirm the exact error fields, retry only idempotently, or collect a new payment method / contact bank if it’s a decline.")
     reply = " ".join(lines)
     return (reply[:900].rstrip() + "…") if len(reply) > 900 else reply
 
-# ---------------- Seed Data ----------------
+# ---------------- Seed Data (descriptions already precise) ----------------
 STATIC_FOODS = [
     {"name": "Greek salad", "category": "salad", "price": 12, "description": "Classic Mediterranean salad; not spicy. Ingredients: cucumber, ripe tomatoes, red onion, Kalamata olives, feta, oregano, olive oil & lemon."},
     {"name": "Veg salad", "category": "salad", "price": 18, "description": "Crisp garden salad; not spicy. Ingredients: mixed greens, cucumber, tomato, carrots, sweet corn, bell peppers, light lemon-herb vinaigrette."},
@@ -344,12 +339,21 @@ def _names_for(cat: str, limit: int = 20) -> List[str]:
     items = _items_for(cat, limit)
     return [it["name"] for it in items]
 
-# ---- Item-detail helpers (NEW) ----
+# ---- Item-detail helpers ----
 def _norm(s: str) -> str:
     return (s or "").strip().lower()
 
 def _similar(a: str, b: str) -> float:
     return SequenceMatcher(None, _norm(a), _norm(b)).ratio()
+
+def list_all_food_names(limit=200) -> List[str]:
+    if db is None:
+        return []
+    try:
+        cur = db["foods"].find({}, {"name": 1}).limit(limit)
+        return [d["name"] for d in cur if d.get("name")]
+    except Exception:
+        return []
 
 def find_item_candidates_by_name(query: str, limit: int = 5):
     """Find likely item matches via exact, regex, and fuzzy ranking."""
@@ -640,12 +644,8 @@ def bump_food_orders(items: List[dict]):
 # ---------------- LLM helpers ----------------
 SYSTEM_PROMPT = (
     "You are TomatoAI, a concise, friendly customer support chatbot for a food delivery platform. "
-    "You help with menus, delivery times, tracking orders, refunds, and reorders.\n\n"
-    "Rules:\n"
-    "1) Use ONLY details from the provided database context for specifics like dish names, order IDs, or status.\n"
-    "2) If a specific detail is missing, ask ONE brief clarifying question or provide a safe generic step (e.g., how to check order status in-app).\n"
-    "3) Never invent order numbers, times, or policies. No markdown tables; short paragraphs or bullets only.\n"
-    "4) Keep answers under ~120 words unless the user explicitly asks for more.\n"
+    "Only use details present in the Database context (Menu & Descriptions). "
+    "Never invent items, ingredients, prices, policies, or order numbers. Keep replies short.\n"
 )
 
 def llm_compose(system_prompt: str, content: str) -> str:
@@ -658,19 +658,11 @@ def llm_compose(system_prompt: str, content: str) -> str:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": content},
             ],
-            temperature=0.3,
+            temperature=0.2,  # tighter to avoid irrelevant outputs
             max_tokens=OPENAI_MAX_TOKENS,
         )
         out = (r.choices[0].message.content or "").strip()
-        if not out:
-            return content
-        usage = getattr(r, "usage", None)
-        if usage:
-            log.info("openai tokens prompt=%s completion=%s total=%s",
-                     getattr(usage, "prompt_tokens", None),
-                     getattr(usage, "completion_tokens", None),
-                     getattr(usage, "total_tokens", None))
-        return out
+        return out or content
     except (APIConnectionError, RateLimitError, APIStatusError) as e:
         log.error("llm_compose openai error type=%s msg=%s", type(e).__name__, str(e))
         return content
@@ -701,6 +693,7 @@ def build_context(user_msg: str, user_id: Optional[str]) -> str:
     cake       = _items_for("cake", MAX_POPULAR)
     pasta      = _items_for("pasta", MAX_POPULAR)
     noodles    = _items_for("noodles", MAX_POPULAR)
+    menu_names = list_all_food_names()
 
     ctx_parts: List[str] = []
     if mem_lines:  ctx_parts.append("Relevant past information:\n" + "\n".join(mem_lines))
@@ -714,8 +707,25 @@ def build_context(user_msg: str, user_id: Optional[str]) -> str:
     if pasta:      ctx_parts.append("Pasta options: " + _fmt_items(pasta))
     if noodles:    ctx_parts.append("Noodles options: " + _fmt_items(noodles))
     if veg:        ctx_parts.append("Veg options: " + _fmt_items(veg))
+    if menu_names: ctx_parts.append("Menu (names only): " + ", ".join(menu_names))
 
     return ("Database context:\n" + "\n".join(ctx_parts) + "\n") if ctx_parts else ""
+
+def guarded_rewrite(user_msg: str, draft: str) -> str:
+    """
+    Extra guardrails so the LLM never goes off-menu.
+    We feed it the exact menu list and strict rules.
+    """
+    menu = ", ".join(list_all_food_names())
+    rules = (
+        "Rules:\n"
+        "• ONLY reference items that appear in Menu.\n"
+        "• If the user mentions an item not in Menu, say it isn't on our menu and suggest the closest 1–3 matches by name only.\n"
+        "• Do not invent ingredients, prices, sizes, or availability beyond the provided Descriptions.\n"
+        "• Keep it under ~80 words unless the customer explicitly asks for more.\n"
+    )
+    content = f"{rules}\nMenu: {menu}\n\nCustomer: {user_msg}\nDraft: {draft}\nRewrite the Draft to answer the Customer. Stay faithful to the Draft."
+    return llm_compose(SYSTEM_PROMPT, content)
 
 # ---------------- Previous Orders intent ----------------
 _PREV_ORDERS_KEYWORDS = (
@@ -736,7 +746,7 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.6.7")
+app = FastAPI(title="Tomato Chatbot API", version="1.6.9")
 
 app.add_middleware(
     CORSMiddleware,
@@ -815,7 +825,7 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.6.7",
+        "version": "1.6.9",
         "force_llm": FORCE_LLM,
     }
 
@@ -876,7 +886,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             response.headers["X-Orders-Count"] = "0"
         return ChatResp(reply=text)
 
-    # ---- Popularity questions ----
+    # ---- Popularity questions (guarded LLM) ----
     if is_popularity_query(user_msg):
         cat = category_from_query(user_msg)
         names = top_items_from_orders(limit=3, category=cat) or top_items_from_foods(limit=3, category=cat)
@@ -886,18 +896,12 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                 if cat else
                 "Top items customers are ordering: " + ", ".join(names) + "."
             )
-            if FORCE_LLM:
-                db_context = build_context(user_msg, user_id)
-                content = f"{db_context}\nCustomer: {user_msg}\nDraft: {draft}\nRewrite the draft for the customer, following the rules."
-                draft = llm_compose(SYSTEM_PROMPT, content)
-                if response is not None:
-                    response.headers["X-Answer-Source"] = "rule+llm:popularity"
-            else:
-                if response is not None:
-                    response.headers["X-Answer-Source"] = "rule:popularity"
-            return ChatResp(reply=draft)
+            final = guarded_rewrite(user_msg, draft) if FORCE_LLM else draft
+            if response is not None:
+                response.headers["X-Answer-Source"] = "rule+llm:popularity" if FORCE_LLM else "rule:popularity"
+            return ChatResp(reply=final)
 
-    # ---- Item detail (NEW): try to answer a specific dish by name) ----
+    # ---- Item detail (try by name; guarded LLM) ----
     candidates = find_item_candidates_by_name(user_msg, limit=3)
     if candidates:
         # Multiple plausible matches → ask to clarify unless the top match is very close
@@ -911,17 +915,12 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
         # Single good match → show description line
         item = candidates[0]
         draft = format_item_detail(item)
-        if FORCE_LLM:
-            content = f"Customer: {user_msg}\nDraft: {draft}\nRewrite concisely (<=80 words). Do not invent details."
-            draft = llm_compose(SYSTEM_PROMPT, content)
-            if response is not None:
-                response.headers["X-Answer-Source"] = "rule+llm:item_detail"
-        else:
-            if response is not None:
-                response.headers["X-Answer-Source"] = "rule:item_detail"
-        return ChatResp(reply=draft)
+        final = guarded_rewrite(user_msg, draft) if FORCE_LLM else draft
+        if response is not None:
+            response.headers["X-Answer-Source"] = "rule+llm:item_detail" if FORCE_LLM else "rule:item_detail"
+        return ChatResp(reply=final)
 
-    # ---- Category-first answers ----
+    # ---- Category-first answers (guarded LLM) ----
     cat = category_from_query(user_msg)
     if cat:
         fetch_map = {
@@ -939,66 +938,18 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             names = fetcher(limit=20)
             if names:
                 draft = f"Our {cat.rstrip('s')} options include: " + ", ".join(names[:10]) + "."
-                if FORCE_LLM:
-                    db_context = build_context(user_msg, user_id)
-                    content = f"{db_context}\nCustomer: {user_msg}\nDraft: {draft}\nRewrite the draft for the customer, following the rules."
-                    draft = llm_compose(SYSTEM_PROMPT, content)
-                    if response is not None:
-                        response.headers["X-Answer-Source"] = "rule+llm:category"
-                else:
-                    if response is not None:
-                        response.headers["X-Answer-Source"] = "rule:category"
-                return ChatResp(reply=draft)
+                final = guarded_rewrite(user_msg, draft) if FORCE_LLM else draft
+                if response is not None:
+                    response.headers["X-Answer-Source"] = "rule+llm:category" if FORCE_LLM else "rule:category"
+                return ChatResp(reply=final)
 
-    # ---- Build LLM context ----
+    # ---- Build LLM context & generic fallback (still guarded) ----
     db_context = build_context(user_msg, user_id)
-    full_prompt = f"{db_context}\nCustomer: {user_msg}\nSupport Agent:"
-
-    # ---- Graceful fallback if LLM unavailable ----
-    if client is None:
-        popular = top_items_from_orders(limit=10) or get_popular_items()
-        if popular:
-            if response is not None:
-                response.headers["X-Answer-Source"] = "fallback:popular"
-            return ChatResp(reply="I’m temporarily offline. Popular dishes: " + ", ".join(popular[:10]) + ".")
-        raise HTTPException(status_code=503, detail="Assistant temporarily unavailable")
-
-    # ---- Call OpenAI ----
-    try:
-        completion = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": full_prompt},
-            ],
-            temperature=0.3,
-            max_tokens=OPENAI_MAX_TOKENS,
-        )
-        answer = (completion.choices[0].message.content or "").strip()
-        if response is not None:
-            response.headers["X-Answer-Source"] = "llm"
-        usage = getattr(completion, "usage", None)
-        if usage:
-            log.info("openai tokens prompt=%s completion=%s total=%s",
-                     getattr(usage, "prompt_tokens", None),
-                     getattr(usage, "completion_tokens", None),
-                     getattr(usage, "total_tokens", None))
-    except (APIConnectionError, RateLimitError, APIStatusError) as e:
-        log.error("openai error req_id=%s type=%s msg=%s", req_id, type(e).__name__, str(e))
-        popular = get_popular_items()
-        if popular:
-            if response is not None:
-                response.headers["X-Answer-Source"] = "fallback:popular_on_error"
-            return ChatResp(reply="I’m having trouble reaching the assistant. Popular dishes: " + ", ".join(popular[:10]) + ".")
-        raise HTTPException(status_code=502, detail="Chat service upstream error")
-    except Exception as e:
-        log.exception("openai unexpected req_id=%s err=%s", req_id, e)
-        popular = get_popular_items()
-        if popular:
-            if response is not None:
-                response.headers["X-Answer-Source"] = "fallback:popular_on_exception"
-            return ChatResp(reply="I’m having trouble reaching the assistant. Popular dishes: " + ", ".join(popular[:10]) + ".")
-        raise HTTPException(status_code=502, detail="Chat service upstream error")
+    draft = "How can I help with our menu, your order, or delivery?"
+    content = f"{db_context}\nCustomer: {user_msg}\nDraft: {draft}\nFollow the rules above."
+    answer = guarded_rewrite(user_msg, draft) if FORCE_LLM else llm_compose(SYSTEM_PROMPT, content)
+    if response is not None:
+        response.headers["X-Answer-Source"] = "llm" if FORCE_LLM else "llm:plain"
 
     # ---- Persist memory (best-effort) ----
     if memory and user_id:
