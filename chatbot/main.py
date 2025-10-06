@@ -14,6 +14,7 @@ from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from openai import OpenAI, APIConnectionError, RateLimitError, APIStatusError
 from dotenv import load_dotenv
+from difflib import SequenceMatcher  # <-- NEW
 
 try:
     from bson import ObjectId
@@ -212,141 +213,45 @@ def explain_stripe_error(text: str) -> str:
 
 # ---------------- Seed Data ----------------
 STATIC_FOODS = [
-    {
-        "name": "Greek salad", "category": "salad", "price": 12,
-        "description": "Classic Mediterranean salad; not spicy. Ingredients: cucumber, ripe tomatoes, red onion, Kalamata olives, feta, oregano, olive oil & lemon."
-    },
-    {
-        "name": "Veg salad", "category": "salad", "price": 18,
-        "description": "Crisp garden salad; not spicy. Ingredients: mixed greens, cucumber, tomato, carrots, sweet corn, bell peppers, light lemon-herb vinaigrette."
-    },
-    {
-        "name": "Clover Salad", "category": "salad", "price": 16,
-        "description": "Wholesome green bowl; not spicy. Ingredients: lettuce, chickpeas, cucumber, cherry tomatoes, fresh herbs, avocado, lemon-tahini dressing."
-    },
-    {
-        "name": "Chicken Salad", "category": "salad", "price": 24,
-        "description": "Protein-packed salad; not spicy. Ingredients: grilled chicken, lettuce, celery, cherry tomatoes, cucumber, yogurt-mayo dressing, parsley."
-    },
+    {"name": "Greek salad", "category": "salad", "price": 12, "description": "Classic Mediterranean salad; not spicy. Ingredients: cucumber, ripe tomatoes, red onion, Kalamata olives, feta, oregano, olive oil & lemon."},
+    {"name": "Veg salad", "category": "salad", "price": 18, "description": "Crisp garden salad; not spicy. Ingredients: mixed greens, cucumber, tomato, carrots, sweet corn, bell peppers, light lemon-herb vinaigrette."},
+    {"name": "Clover Salad", "category": "salad", "price": 16, "description": "Wholesome green bowl; not spicy. Ingredients: lettuce, chickpeas, cucumber, cherry tomatoes, fresh herbs, avocado, lemon-tahini dressing."},
+    {"name": "Chicken Salad", "category": "salad", "price": 24, "description": "Protein-packed salad; not spicy. Ingredients: grilled chicken, lettuce, celery, cherry tomatoes, cucumber, yogurt-mayo dressing, parsley."},
 
-    {
-        "name": "Lasagna Rolls", "category": "rolls", "price": 14,
-        "description": "Baked pasta roll-ups; not spicy. Ingredients: lasagna sheets, ricotta, spinach, mozzarella, marinara sauce, parmesan."
-    },
-    {
-        "name": "Peri Peri Rolls", "category": "rolls", "price": 12,
-        "description": "Fiery wrap; spicy. Ingredients: peri-peri marinated chicken, onions, lettuce, pickles, creamy chili mayo, soft roll/flatbread."
-    },
-    {
-        "name": "Chicken Rolls", "category": "rolls", "price": 20,
-        "description": "Street-style kathi roll; medium spicy. Ingredients: spiced chicken, sautéed onions, capsicum, lime, coriander, egg-paratha or tortilla."
-    },
-    {
-        "name": "Veg Rolls", "category": "rolls", "price": 15,
-        "description": "Hearty veggie wrap; mild. Ingredients: paneer/potato & mixed veg, onions, capsicum, mint-yogurt or chutney, wrapped in paratha/tortilla."
-    },
+    {"name": "Lasagna Rolls", "category": "rolls", "price": 14, "description": "Baked pasta roll-ups; not spicy. Ingredients: lasagna sheets, ricotta, spinach, mozzarella, marinara sauce, parmesan."},
+    {"name": "Peri Peri Rolls", "category": "rolls", "price": 12, "description": "Fiery wrap; spicy. Ingredients: peri-peri marinated chicken, onions, lettuce, pickles, creamy chili mayo, soft roll/flatbread."},
+    {"name": "Chicken Rolls", "category": "rolls", "price": 20, "description": "Street-style kathi roll; medium spicy. Ingredients: spiced chicken, sautéed onions, capsicum, lime, coriander, egg-paratha or tortilla."},
+    {"name": "Veg Rolls", "category": "rolls", "price": 15, "description": "Hearty veggie wrap; mild. Ingredients: paneer/potato & mixed veg, onions, capsicum, mint-yogurt or chutney, wrapped in paratha/tortilla."},
 
-    {
-        "name": "Ripple Ice Cream", "category": "desserts", "price": 14,
-        "description": "Creamy ice cream streaked with sauce; sweet. Ingredients: dairy base, fudge/caramel ‘ripple’, vanilla."
-    },
-    {
-        "name": "Fruit Ice Cream", "category": "desserts", "price": 22,
-        "description": "Real fruit in every scoop; sweet. Ingredients: dairy base, seasonal fruit purée (e.g., strawberry/mango), fruit chunks."
-    },
-    {
-        "name": "Jar Ice Cream", "category": "desserts", "price": 10,
-        "description": "Layered jar dessert; sweet. Ingredients: ice cream, crushed cookies/cake, sauce (chocolate/caramel), whipped cream."
-    },
-    {
-        "name": "Vanilla Ice Cream", "category": "desserts", "price": 12,
-        "description": "Classic vanilla; sweet. Ingredients: dairy base, Madagascar/Bourbon vanilla."
-    },
+    {"name": "Ripple Ice Cream", "category": "desserts", "price": 14, "description": "Creamy ice cream streaked with sauce; sweet. Ingredients: dairy base, fudge/caramel ‘ripple’, vanilla."},
+    {"name": "Fruit Ice Cream", "category": "desserts", "price": 22, "description": "Real fruit in every scoop; sweet. Ingredients: dairy base, seasonal fruit purée (e.g., strawberry/mango), fruit chunks."},
+    {"name": "Jar Ice Cream", "category": "desserts", "price": 10, "description": "Layered jar dessert; sweet. Ingredients: ice cream, crushed cookies/cake, sauce (chocolate/caramel), whipped cream."},
+    {"name": "Vanilla Ice Cream", "category": "desserts", "price": 12, "description": "Classic vanilla; sweet. Ingredients: dairy base, Madagascar/Bourbon vanilla."},
 
-    {
-        "name": "Chicken Sandwich", "category": "sandwich", "price": 12,
-        "description": "Comfort sandwich; not spicy. Ingredients: grilled or crispy chicken, lettuce, tomato, pickles, mayo in toasted bread/bun."
-    },
-    {
-        "name": "Vegan Sandwich", "category": "sandwich", "price": 18,
-        "description": "Plant-based; mild. Ingredients: hummus or avocado, grilled vegetables, cucumber, tomato, greens, olive oil on whole-grain bread."
-    },
-    {
-        "name": "Grilled Sandwich", "category": "sandwich", "price": 16,
-        "description": "Golden & melty; not spicy. Ingredients: butter-toasted bread, cheese, tomato, onion, herbs."
-    },
-    {
-        "name": "Bread Sandwich", "category": "sandwich", "price": 24,
-        "description": "Simple veggie sandwich; mild. Ingredients: soft bread, cucumber, tomato, lettuce, cheese (optional), butter/mayo."
-    },
+    {"name": "Chicken Sandwich", "category": "sandwich", "price": 12, "description": "Comfort sandwich; not spicy. Ingredients: grilled or crispy chicken, lettuce, tomato, pickles, mayo in toasted bread/bun."},
+    {"name": "Vegan Sandwich", "category": "sandwich", "price": 18, "description": "Plant-based; mild. Ingredients: hummus or avocado, grilled vegetables, cucumber, tomato, greens, olive oil on whole-grain bread."},
+    {"name": "Grilled Sandwich", "category": "sandwich", "price": 16, "description": "Golden & melty; not spicy. Ingredients: butter-toasted bread, cheese, tomato, onion, herbs."},
+    {"name": "Bread Sandwich", "category": "sandwich", "price": 24, "description": "Simple veggie sandwich; mild. Ingredients: soft bread, cucumber, tomato, lettuce, cheese (optional), butter/mayo."},
 
-    {
-        "name": "Cup Cake", "category": "cake", "price": 14,
-        "description": "Single-serve frosted cake; sweet. Ingredients: flour, butter, sugar, eggs, vanilla/cocoa, buttercream frosting."
-    },
-    {
-        "name": "Vegan Cake", "category": "cake", "price": 12,
-        "description": "Egg- & dairy-free; sweet. Ingredients: flour, cocoa/vanilla, plant milk, vegetable oil, sugar, vegan frosting."
-    },
-    {
-        "name": "Butterscotch Cake", "category": "cake", "price": 20,
-        "description": "Rich caramel notes; sweet. Ingredients: vanilla sponge, butterscotch sauce, praline/toffee bits, whipped cream."
-    },
-    {
-        "name": "Sliced Cake", "category": "cake", "price": 15,
-        "description": "Classic tea-time slice; sweet. Ingredients: butter pound cake/vanilla sponge, light glaze (optional)."
-    },
+    {"name": "Cup Cake", "category": "cake", "price": 14, "description": "Single-serve frosted cake; sweet. Ingredients: flour, butter, sugar, eggs, vanilla/cocoa, buttercream frosting."},
+    {"name": "Vegan Cake", "category": "cake", "price": 12, "description": "Egg- & dairy-free; sweet. Ingredients: flour, cocoa/vanilla, plant milk, vegetable oil, sugar, vegan frosting."},
+    {"name": "Butterscotch Cake", "category": "cake", "price": 20, "description": "Rich caramel notes; sweet. Ingredients: vanilla sponge, butterscotch sauce, praline/toffee bits, whipped cream."},
+    {"name": "Sliced Cake", "category": "cake", "price": 15, "description": "Classic tea-time slice; sweet. Ingredients: butter pound cake/vanilla sponge, light glaze (optional)."},
 
-    {
-        "name": "Garlic Mushroom", "category": "veg", "price": 14,
-        "description": "Savory sauté; not spicy. Ingredients: button mushrooms, garlic, butter/olive oil, parsley, black pepper."
-    },
-    {
-        "name": "Fried Cauliflower", "category": "veg", "price": 22,
-        "description": "Crispy florets; mild. Ingredients: cauliflower, seasoned batter, oil for frying, optional garlic/pepper sprinkle."
-    },
-    {
-        "name": "Mix Veg Pulao", "category": "veg", "price": 10,
-        "description": "Fragrant rice; mildly spiced. Ingredients: basmati rice, peas, carrots, beans, onions, whole spices (cumin, bay, clove), ghee/oil."
-    },
-    {
-        "name": "Rice Zucchini", "category": "veg", "price": 12,
-        "description": "Light herby rice; not spicy. Ingredients: rice, sautéed zucchini, garlic, olive oil, parsley, lemon zest."
-    },
+    {"name": "Garlic Mushroom", "category": "veg", "price": 14, "description": "Savory sauté; not spicy. Ingredients: button mushrooms, garlic, butter/olive oil, parsley, black pepper."},
+    {"name": "Fried Cauliflower", "category": "veg", "price": 22, "description": "Crispy florets; mild. Ingredients: cauliflower, seasoned batter, oil for frying, optional garlic/pepper sprinkle."},
+    {"name": "Mix Veg Pulao", "category": "veg", "price": 10, "description": "Fragrant rice; mildly spiced. Ingredients: basmati rice, peas, carrots, beans, onions, whole spices (cumin, bay, clove), ghee/oil."},
+    {"name": "Rice Zucchini", "category": "veg", "price": 12, "description": "Light herby rice; not spicy. Ingredients: rice, sautéed zucchini, garlic, olive oil, parsley, lemon zest."},
 
-    {
-        "name": "Cheese Pasta", "category": "pasta", "price": 12,
-        "description": "Comfort cheesy pasta; not spicy. Ingredients: pasta, cheddar/mozzarella, milk/cream, butter, garlic."
-    },
-    {
-        "name": "Tomato Pasta", "category": "pasta", "price": 18,
-        "description": "Bright marinara; mild. Ingredients: pasta, tomato sauce, garlic, olive oil, basil, parmesan."
-    },
-    {
-        "name": "Creamy Pasta", "category": "pasta", "price": 16,
-        "description": "Silky white-sauce pasta; not spicy. Ingredients: pasta, cream or béchamel, garlic, parmesan, black pepper."
-    },
-    {
-        "name": "Chicken Pasta", "category": "pasta", "price": 24,
-        "description": "Hearty & satisfying; mild. Ingredients: pasta, grilled chicken, tomato or cream sauce, garlic, herbs, parmesan."
-    },
+    {"name": "Cheese Pasta", "category": "pasta", "price": 12, "description": "Comfort cheesy pasta; not spicy. Ingredients: pasta, cheddar/mozzarella, milk/cream, butter, garlic."},
+    {"name": "Tomato Pasta", "category": "pasta", "price": 18, "description": "Bright marinara; mild. Ingredients: pasta, tomato sauce, garlic, olive oil, basil, parmesan."},
+    {"name": "Creamy Pasta", "category": "pasta", "price": 16, "description": "Silky white-sauce pasta; not spicy. Ingredients: pasta, cream or béchamel, garlic, parmesan, black pepper."},
+    {"name": "Chicken Pasta", "category": "pasta", "price": 24, "description": "Hearty & satisfying; mild. Ingredients: pasta, grilled chicken, tomato or cream sauce, garlic, herbs, parmesan."},
 
-    {
-        "name": "Butter Noodles", "category": "noodles", "price": 14,
-        "description": "Simple & comforting; not spicy. Ingredients: noodles, butter, garlic (optional), herbs, salt & pepper."
-    },
-    {
-        "name": "Veg Noodles", "category": "noodles", "price": 12,
-        "description": "Stir-fried chow mein; mild to medium. Ingredients: wheat noodles, cabbage, carrot, bell pepper, spring onion, soy-garlic sauce."
-    },
-    {
-        "name": "Somen Noodles", "category": "noodles", "price": 20,
-        "description": "Japanese thin noodles; not spicy. Ingredients: chilled somen, light soy-dashi dipping sauce, scallions, sesame."
-    },
-    {
-        "name": "Cooked Noodles", "category": "noodles", "price": 15,
-        "description": "House stir-fried noodles; mild. Ingredients: boiled noodles, mixed vegetables, soy sauce, garlic, a touch of sesame oil."
-    },
+    {"name": "Butter Noodles", "category": "noodles", "price": 14, "description": "Simple & comforting; not spicy. Ingredients: noodles, butter, garlic (optional), herbs, salt & pepper."},
+    {"name": "Veg Noodles", "category": "noodles", "price": 12, "description": "Stir-fried chow mein; mild to medium. Ingredients: wheat noodles, cabbage, carrot, bell pepper, spring onion, soy-garlic sauce."},
+    {"name": "Somen Noodles", "category": "noodles", "price": 20, "description": "Japanese thin noodles; not spicy. Ingredients: chilled somen, light soy-dashi dipping sauce, scallions, sesame."},
+    {"name": "Cooked Noodles", "category": "noodles", "price": 15, "description": "House stir-fried noodles; mild. Ingredients: boiled noodles, mixed vegetables, soy sauce, garlic, a touch of sesame oil."},
 ]
 
 def bootstrap_foods_if_empty():
@@ -354,7 +259,6 @@ def bootstrap_foods_if_empty():
     if db is None:
         return
     try:
-        # If we already have a decent menu, still make sure descriptions get filled in
         for item in STATIC_FOODS:
             doc = {
                 "name": item["name"].strip(),
@@ -365,12 +269,11 @@ def bootstrap_foods_if_empty():
             }
             db["foods"].update_one({"name": doc["name"]}, {"$set": doc}, upsert=True)
 
-        # Helpful indexes
         try:
             db["foods"].create_index([("name", 1)], unique=True)
             db["foods"].create_index([("category", 1)])
             db["foods"].create_index([("orders", -1)])
-            db["foods"].create_index([("description", "text")])  # enable keyword search later
+            db["foods"].create_index([("description", "text")])
         except Exception:
             pass
 
@@ -440,6 +343,68 @@ def _fmt_items(items):
 def _names_for(cat: str, limit: int = 20) -> List[str]:
     items = _items_for(cat, limit)
     return [it["name"] for it in items]
+
+# ---- Item-detail helpers (NEW) ----
+def _norm(s: str) -> str:
+    return (s or "").strip().lower()
+
+def _similar(a: str, b: str) -> float:
+    return SequenceMatcher(None, _norm(a), _norm(b)).ratio()
+
+def find_item_candidates_by_name(query: str, limit: int = 5):
+    """Find likely item matches via exact, regex, and fuzzy ranking."""
+    if db is None:
+        return []
+    q = _norm(query)
+    if not q:
+        return []
+    try:
+        # exact case-insensitive
+        exact = list(db["foods"].find(
+            {"name": {"$regex": f"^{re.escape(query)}$", "$options": "i"}},
+            {"_id": 0, "name": 1, "price": 1, "category": 1, "description": 1}
+        ).limit(1))
+        if exact:
+            return exact
+
+        # contains search
+        contains = list(db["foods"].find(
+            {"name": {"$regex": re.escape(query), "$options": "i"}},
+            {"_id": 0, "name": 1, "price": 1, "category": 1, "description": 1}
+        ).limit(limit * 3))
+
+        # fallback to all names if nothing contains
+        pool = contains or list(db["foods"].find({}, {"_id": 0, "name": 1, "price": 1, "category": 1, "description": 1}))
+
+        ranked = []
+        for doc in pool:
+            name = doc.get("name") or ""
+            desc = doc.get("description") or ""
+            score = max(_similar(query, name), _similar(query, desc[:60]))
+            ranked.append((score, doc))
+        ranked.sort(key=lambda t: t[0], reverse=True)
+        return [d for (score, d) in ranked[:limit] if score >= 0.55]
+    except Exception:
+        log.exception("find_item_candidates_by_name failed")
+        return []
+
+def format_item_detail(item: dict) -> str:
+    """Single-line, policy-compliant item detail."""
+    name = item.get("name", "Item")
+    price = item.get("price")
+    cat = (item.get("category") or "").rstrip("s")
+    desc = (item.get("description") or "").strip()
+    # price format
+    try:
+        price_str = f"${int(float(price))}" if float(price).is_integer() else f"${float(price)}"
+    except Exception:
+        price_str = f"${price}" if price is not None else ""
+    bits = [f"{name} ({price_str})"]
+    if cat:
+        bits.append(f"– {cat}")
+    if desc:
+        bits.append(f": {desc}")
+    return " ".join(bits)
 
 # ---- User/Orders helpers ----
 def _possible_user_id_filters(user_id: str):
@@ -538,13 +503,7 @@ def get_user_recent_orders_detailed(user_id: Optional[str], limit=MAX_RECENT):
                     "items": {"$ifNull": ["$items", []]},
                     "amount": 1,
                     "status": 1,
-                    # pick first non-null timestamp
-                    "dt": {
-                        "$ifNull": [
-                            "$date",
-                            {"$ifNull": ["$order_date", "$created_at"]},
-                        ]
-                    },
+                    "dt": {"$ifNull": ["$date", {"$ifNull": ["$order_date", "$created_at"]}]},
                 }
             },
             {"$sort": {"dt": -1, "_id": -1}},
@@ -617,16 +576,10 @@ def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> Lis
                         "from": "foods",
                         "let": {"itemName": "$items.name"},
                         "pipeline": [
-                            {
-                                "$match": {
-                                    "$expr": {
-                                        "$and": [
-                                            {"$eq": [{"$toLower": "$name"}, {"$toLower": "$$itemName"}]},
-                                            {"$eq": [{"$toLower": "$category"}, cat_lower]},
-                                        ]
-                                    }
-                                }
-                            },
+                            {"$match": {"$expr": {"$and": [
+                                {"$eq": [{"$toLower": "$name"}, {"$toLower": "$$itemName"}]},
+                                {"$eq": [{"$toLower": "$category"}, cat_lower]},
+                            ]}}},
                             {"$project": {"_id": 0, "name": 1}},
                         ],
                         "as": "food"
@@ -783,7 +736,7 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.6.6")
+app = FastAPI(title="Tomato Chatbot API", version="1.6.7")
 
 app.add_middleware(
     CORSMiddleware,
@@ -862,7 +815,7 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.6.6",
+        "version": "1.6.7",
         "force_llm": FORCE_LLM,
     }
 
@@ -943,6 +896,30 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                 if response is not None:
                     response.headers["X-Answer-Source"] = "rule:popularity"
             return ChatResp(reply=draft)
+
+    # ---- Item detail (NEW): try to answer a specific dish by name) ----
+    candidates = find_item_candidates_by_name(user_msg, limit=3)
+    if candidates:
+        # Multiple plausible matches → ask to clarify unless the top match is very close
+        if len(candidates) > 1 and _similar(user_msg, candidates[0].get("name", "")) < 0.88:
+            choices = ", ".join(c.get("name") for c in candidates)
+            text = f"Did you mean: {choices}? Tell me the exact name for details."
+            if response is not None:
+                response.headers["X-Answer-Source"] = "rule:item_disambiguate"
+            return ChatResp(reply=text)
+
+        # Single good match → show description line
+        item = candidates[0]
+        draft = format_item_detail(item)
+        if FORCE_LLM:
+            content = f"Customer: {user_msg}\nDraft: {draft}\nRewrite concisely (<=80 words). Do not invent details."
+            draft = llm_compose(SYSTEM_PROMPT, content)
+            if response is not None:
+                response.headers["X-Answer-Source"] = "rule+llm:item_detail"
+        else:
+            if response is not None:
+                response.headers["X-Answer-Source"] = "rule:item_detail"
+        return ChatResp(reply=draft)
 
     # ---- Category-first answers ----
     cat = category_from_query(user_msg)
