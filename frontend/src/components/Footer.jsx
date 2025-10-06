@@ -1,5 +1,6 @@
 import React from 'react'
 import { assets } from '../assets/assets'
+import { Link } from 'react-router-dom';
 
 const Footer = () => {
     const admin_url = import.meta.env.ADMIN_URL;
