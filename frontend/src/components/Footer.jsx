@@ -2,6 +2,7 @@ import React from 'react'
 import { assets } from '../assets/assets'
 
 const Footer = () => {
+    const admin_url = import.meta.env.ADMIN_URL;
   return (
     <div className='text-[#d9d9d9] bg-[#323232] flex flex-col items-center gap-[20px] py-[20px] px-[8vw] pt-[80px] mt-10' id='contact'>
         <div className='w-full sm:grid grid-cols-[2fr_1fr_1fr] sm:gap-[80px]'>
@@ -28,6 +29,7 @@ const Footer = () => {
                 <ul>
                     <li>+1-100-200-300</li>
                     <li>contact@tomato.com</li>
+                    <Link to={admin_url}>Admin Dashboard</Link>
                 </ul>
             </div>
         </div>
