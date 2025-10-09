@@ -583,7 +583,7 @@ def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> Lis
                             {"$match": {"$expr": {"$and": [
                                 {"$eq": [{"$toLower": "$name"}, {"$toLower": "$$itemName"}]},
                                 {"$eq": [{"$toLower": "$category"}, cat_lower]},
-                            ]}}},
+                            ]}}}},
                             {"$project": {"_id": 0, "name": 1}},
                         ],
                         "as": "food"
@@ -752,16 +752,24 @@ def is_payment_reason_query(text: str) -> bool:
     return any(k in t for k in _PAYMENT_REASON_KEYWORDS)
 
 def _latest_order_for_user(user_id: Optional[str]):
-    """Return the most recent order for this user (sorted by `date` desc)."""
+    """Return the most recent order for this user (robust multi-field sort)."""
     if db is None or not user_id or user_id == "guest":
         return None
     try:
         flt = _possible_user_id_filters(user_id)
         if not flt:
             return None
+        # Sort by likely date fields, then _id
         doc = db["orders"].find_one(
             flt,
-            sort=[("date", -1), ("_id", -1)]
+            sort=[
+                ("date", -1),
+                ("dt", -1),
+                ("order_date", -1),
+                ("created_at", -1),
+                ("updated_at", -1),
+                ("_id", -1),
+            ]
         )
         return doc
     except Exception:
@@ -778,8 +786,59 @@ def _map_stripe_reason(code: str, decline_code: str = "", fallback: str = "") ->
         return STRIPE_ERRORS["codes"][code_n]
     return fallback or "The payment didn’t complete. Please try again, use a different card, or contact your bank."
 
+def _extract_payment_from_order(order: dict):
+    """
+    Normalize payment details from common shapes, including your exact schema:
+    order.paymentInfo.stripe.{status, code, message} with successMessage on paymentInfo.
+    Returns: {status, errorCode, errorMessage, decline_code, successMessage}
+    status in {'succeeded','failed',None}
+    """
+    empty = {"status": None, "errorCode": "", "errorMessage": "", "decline_code": "", "successMessage": ""}
+    if not order:
+        return empty
+
+    # Base blocks
+    p = (order.get("paymentInfo")
+         or order.get("payment_info")
+         or order.get("payment")
+         or {})
+
+    # Known fields
+    status = (p.get("status") or order.get("payment_status") or "").strip().lower() or None
+    success_msg = (p.get("successMessage") or p.get("message") or "").strip()
+    err_code = (p.get("errorCode") or p.get("code") or order.get("errorCode") or "").strip()
+    err_msg  = (p.get("errorMessage") or p.get("message") or order.get("errorMessage") or "").strip()
+
+    # Nested Stripe block (your schema)
+    stripe = p.get("stripe") or order.get("stripe") or {}
+    if isinstance(stripe, dict) and stripe:
+        status = (stripe.get("status") or status or "").strip().lower() or status
+        err_code = (stripe.get("code") or err_code or "").strip() or err_code
+        err_msg  = (stripe.get("message") or err_msg or "").strip() or err_msg
+        success_msg = (p.get("successMessage") or success_msg).strip()
+
+    # Try to pull decline_code from any text
+    decline_code = ""
+    for blob in (p, stripe, {"err": err_msg}):
+        try:
+            text = " ".join(str(v) for v in blob.values()) if isinstance(blob, dict) else str(blob)
+        except Exception:
+            text = ""
+        m = re.search(r"decline[_\s-]?code\s*[:=]\s*([a-zA-Z0-9_ -]+)", text or "", re.I)
+        if m:
+            decline_code = _n(m.group(1))
+            break
+
+    return {
+        "status": status,
+        "errorCode": err_code,
+        "errorMessage": err_msg,
+        "decline_code": decline_code,
+        "successMessage": success_msg,
+    }
+
 def _explain_payment_outcome(order: dict, user_asked_failed: bool) -> str:
-    """Concise explanation using order.paymentInfo; corrects user if they think it failed but it succeeded."""
+    """Concise explanation using normalized payment extraction; corrects user if needed."""
     if not order:
         return "I couldn’t find any payments on your account yet."
 
@@ -790,24 +849,16 @@ def _explain_payment_outcome(order: dict, user_asked_failed: bool) -> str:
     except Exception:
         amt_str = f"${amt}" if amt is not None else ""
 
-    pinfo = order.get("paymentInfo") or {}
-    status = (pinfo.get("status") or "").strip().lower()  # 'succeeded' | 'failed'
-    success_msg = (pinfo.get("successMessage") or "").strip()
-    err_code = (pinfo.get("errorCode") or "").strip()
-    err_msg = (pinfo.get("errorMessage") or "").strip()
-
-    # Try to recover decline_code from errorMessage (optional)
-    decline_code = ""
-    m = re.search(r"decline[_\s-]?code\s*[:=]\s*([a-zA-Z0-9_ -]+)", err_msg, re.I)
-    if m:
-        decline_code = _n(m.group(1))
+    info = _extract_payment_from_order(order)
+    status = info["status"]
+    err_code = info["errorCode"]
+    err_msg = info["errorMessage"]
+    decline_code = info["decline_code"]
+    success_msg = info["successMessage"]
 
     if status == "succeeded":
-        # If the user asked "why did it fail" but it actually succeeded, be explicit.
         base = f"Your most recent payment on {when} for {amt_str} was successful."
-        if user_asked_failed:
-            return base  # short and clear
-        return f"{base} {success_msg}".strip()
+        return base if user_asked_failed else f"{base} {success_msg}".strip()
 
     if status == "failed":
         reason = _map_stripe_reason(err_code, decline_code=decline_code, fallback=err_msg)
@@ -815,7 +866,12 @@ def _explain_payment_outcome(order: dict, user_asked_failed: bool) -> str:
             return f"Your most recent payment on {when} for {amt_str} was unsuccessful. Reason: {err_code} — {reason}"
         return f"Your most recent payment on {when} for {amt_str} was unsuccessful. {reason}"
 
-    return f"I found an order on {when} for {amt_str}, but I couldn’t confirm the payment status yet."
+    # Unknown status — include any hint if present
+    hint = ""
+    if err_code or err_msg or decline_code:
+        reason = _map_stripe_reason(err_code, decline_code=decline_code, fallback=err_msg)
+        hint = f" Possible reason: {reason}"
+    return f"I found an order on {when} for {amt_str}, but I couldn’t confirm the payment status yet.{hint}".strip()
 
 # ---------------- API Models ----------------
 class ChatReq(BaseModel):
@@ -826,7 +882,7 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.7.0")
+app = FastAPI(title="Tomato Chatbot API", version="1.7.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -905,7 +961,7 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.7.0",
+        "version": "1.7.1",
         "force_llm": FORCE_LLM,
     }
 
