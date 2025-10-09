@@ -12,7 +12,7 @@ const orderSchema = new mongoose.Schema({
         status: { 
         type: String, 
         enum: ['succeeded', 'failed'], 
-        default: 'failed' 
+        default: undefined 
         },
         successMessage: { type: String, default: '' }, // e.g. "Payment completed successfully."
         errorCode: { type: String, default: '' },      // e.g. "card_declined"
