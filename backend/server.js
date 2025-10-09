@@ -16,10 +16,11 @@ const port = process.env.PORT || 4000;
 // ---------- Core middleware (CORS first) ----------
 app.use(cors());
 
-// ⚠️ Stripe webhook must receive RAW body and be mounted BEFORE express.json():
-app.post('/api/order/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
-
-// JSON parser for the rest of the app
+// Stripe webhook must receive RAW body and be mounted BEFORE express.json():
+app.post('/api/order/webhook',
+  express.raw({ type: 'application/json' }),
+  handleStripeWebhook
+);
 app.use(express.json({ limit: '10kb' }));
 
 // ---------- DB / Cloud ----------
@@ -30,7 +31,7 @@ connectCloudinary();
 app.use('/api/food', foodRouter);
 app.use('/api/user', userRouter);
 app.use('/api/cart', cartRouter);
-app.use('/api/order', orderRouter); // includes /place, /verify, /list, /status, etc.
+app.use('/api/order', orderRouter); 
 app.use('/api/chat', chatRouter);
 
 // ---------- Health ----------

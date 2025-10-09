@@ -126,6 +126,51 @@ const verifyOrder = async (req, res) => {
   }
 };
 
+const reconcileOrder = async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const order = await orderModel.findById(orderId);
+    if (!order) return res.status(404).json({ success: false, message: "Order not found" });
+
+    const sessionId = order?.paymentInfo?.stripe?.sessionId;
+    if (!sessionId) return res.json({ success: false, message: "No sessionId on order" });
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ["payment_intent.latest_charge"],
+    });
+
+    if (session.payment_status === "paid") {
+      const pi = session.payment_intent;
+      const chargeId =
+        pi?.latest_charge && typeof pi.latest_charge === "object" ? pi.latest_charge.id : "";
+
+      await orderModel.findByIdAndUpdate(orderId, {
+        $set: {
+          payment: true,
+          status: "PAID",
+          "paymentInfo.status": "succeeded",
+          "paymentInfo.successMessage": "Payment succeeded (reconciled).",
+          "paymentInfo.stripe.paymentIntentId": pi?.id || "",
+          "paymentInfo.stripe.chargeId": chargeId,
+          "paymentInfo.paidAt": new Date(),
+        },
+      });
+
+      return res.json({ success: true, reconciled: true, message: "Order marked as paid." });
+    }
+
+    // Not paid
+    return res.json({
+      success: false,
+      reconciled: false,
+      message: `Session not paid (status: ${session.payment_status})`,
+    });
+  } catch (err) {
+    console.error("[reconcileOrder] error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // Stripe webhook: authoritative final outcomes
 const handleStripeWebhook = async (req, res) => {
   const sig = req.headers["stripe-signature"];
@@ -300,4 +345,4 @@ const updateStatus = async (req, res) => {
   }
 };
 
-export { placeOrder, verifyOrder, userOrders, listOrders, updateStatus, handleStripeWebhook};
+export { placeOrder, verifyOrder, userOrders, listOrders, updateStatus, handleStripeWebhook, reconcileOrder};
