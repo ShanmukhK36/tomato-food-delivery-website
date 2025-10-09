@@ -154,58 +154,6 @@ STRIPE_ERRORS = {
     },
 }
 
-def is_stripe_query(text: str) -> bool:
-    t = (text or "").lower()
-    if "stripe" in t or "payment_intent" in t or "setup_intent" in t:
-        return True
-    if "decline_code" in t or "card_declined" in t:
-        return True
-    for kw in ("error:", "code:", "type:", "payment_method", "3ds", "3d secure", "authentication_required"):
-        if kw in t:
-            return True
-    for key in list(STRIPE_ERRORS["types"].keys()) + list(STRIPE_ERRORS["codes"].keys()) + list(STRIPE_ERRORS["decline_codes"].keys()):
-        if key.replace("_", " ") in t or key in t:
-            return True
-    return False
-
-def explain_stripe_error(text: str) -> str:
-    t = (text or "")
-    low = t.lower()
-    found_types, found_codes, found_declines, found_statuses = [], [], [], []
-
-    for k in STRIPE_ERRORS["types"]:
-        if k in low: found_types.append(k)
-    for k in STRIPE_ERRORS["codes"]:
-        if k in low: found_codes.append(k)
-    for k in STRIPE_ERRORS["decline_codes"]:
-        if k in low: found_declines.append(k)
-    for k in STRIPE_ERRORS["intents"]:
-        if k in low: found_statuses.append(k)
-
-    for m in re.finditer(r'(type|code|decline_code)\s*["\':]\s*["\']?([a-zA-Z0-9_\-]+)', t):
-        field = _n(m.group(1)); val = _n(m.group(2))
-        if field == "type" and val in STRIPE_ERRORS["types"] and val not in found_types: found_types.append(val)
-        elif field == "code" and val in STRIPE_ERRORS["codes"] and val not in found_codes: found_codes.append(val)
-        elif field == "decline_code" and val in STRIPE_ERRORS["decline_codes"] and val not in found_declines: found_declines.append(val)
-
-    lines: List[str] = []
-    if ("card_declined" in found_codes or "card_error" in found_types) and found_declines:
-        dc = found_declines[0]; lines.append(f"Stripe says **card_declined / {dc}** — {STRIPE_ERRORS['decline_codes'][dc]}")
-    if found_codes and not lines:
-        c = found_codes[0]; lines.append(f"Stripe **{c}** — {STRIPE_ERRORS['codes'][c]}")
-    if found_types and not lines:
-        ty = found_types[0]; lines.append(f"Stripe **{ty}** — {STRIPE_ERRORS['types'][ty]}")
-    if found_statuses:
-        st = found_statuses[0]; lines.append(f"Status **{st}** — {STRIPE_ERRORS['intents'][st]}")
-
-    if not lines:
-        lines = [
-            "I can help with Stripe errors. If you paste the JSON (type / code / decline_code), I’ll decode it.",
-        ]
-    lines.append("Next steps: confirm the exact error fields, retry only idempotently, or collect a new payment method / contact bank if it’s a decline.")
-    reply = " ".join(lines)
-    return (reply[:900].rstrip() + "…") if len(reply) > 900 else reply
-
 # ---------------- Seed Data (descriptions already precise) ----------------
 STATIC_FOODS = [
     {"name": "Greek salad", "category": "salad", "price": 12, "description": "Classic Mediterranean salad; not spicy. Ingredients: cucumber, ripe tomatoes, red onion, Kalamata olives, feta, oregano, olive oil & lemon."},
@@ -478,7 +426,7 @@ def _summarize_items(items, max_items=3):
     items = items or []
     for it in items:
         name = (it.get("name") or "").strip()
-        qty = int(it.get("qty") or 1)
+        qty = int(it.get("qty") or it.get("quantity") or 1)
         total_qty += qty
         if len(parts) < max_items and name:
             parts.append(f"{name} ×{qty}")
@@ -528,35 +476,6 @@ def get_user_recent_orders_detailed(user_id: Optional[str], limit=MAX_RECENT):
         log.exception("get_user_recent_orders_detailed failed")
         return []
 
-# Category helpers
-def get_sandwich_names(limit=20): return _names_for("sandwich", limit)
-def get_rolls_names(limit=20):    return _names_for("rolls", limit)
-def get_salad_names(limit=20):    return _names_for("salad", limit)
-def get_desserts_names(limit=20): return _names_for("desserts", limit)
-def get_cake_names(limit=20):     return _names_for("cake", limit)
-def get_pasta_names(limit=20):    return _names_for("pasta", limit)
-def get_noodles_names(limit=20):  return _names_for("noodles", limit)
-def get_veg_names(limit=20):      return _names_for("veg", limit)
-
-SYNONYMS = {
-    "sub": "sandwich", "subs": "sandwich", "hoagie": "sandwich",
-    "wrap": "rolls", "wraps": "rolls",
-    "desert": "desserts", "deserts": "desserts",
-    "pure veg": "veg",
-}
-def category_from_query(text: str) -> Optional[str]:
-    lower = text.lower()
-    for raw in ("sandwich", "roll", "rolls", "salad", "dessert", "desserts", "cake", "pasta", "noodle", "noodles", "veg", "pure veg"):
-        if raw in lower:
-            if raw in ("roll",): return "rolls"
-            if raw in ("dessert",): return "desserts"
-            if raw in ("pure veg",): return "veg"
-            return raw.rstrip("s")
-    for alias, canon in SYNONYMS.items():
-        if alias in lower:
-            return canon
-    return None
-
 # -------- Popularity helpers --------
 POPULAR_KEYWORDS = ("popular", "best", "bestseller", "most ordered", "most-ordered", "top", "famous", "hot")
 
@@ -570,7 +489,7 @@ def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> Lis
     try:
         pipeline = [
             {"$unwind": "$items"},
-            {"$addFields": {"qty": {"$ifNull": ["$items.qty", 1]}}},
+            {"$addFields": {"qty": {"$ifNull": ["$items.qty", {"$ifNull": ["$items.quantity", 1]}]}}},
         ]
         if category:
             cat_lower = category.lower()
@@ -634,7 +553,7 @@ def bump_food_orders(items: List[dict]):
     try:
         for it in items or []:
             name = (it.get("name") or "").strip()
-            qty = int(it.get("qty") or 1)
+            qty = int(it.get("qty") or it.get("quantity") or 1)
             if not name:
                 continue
             db["foods"].update_one({"name": name}, {"$inc": {"orders": qty}})
@@ -737,6 +656,138 @@ def is_previous_orders_query(text: str) -> bool:
     t = (text or "").lower()
     return any(k in t for k in _PREV_ORDERS_KEYWORDS)
 
+# ---------------- Payment reason helpers (NEW) ----------------
+_PAYMENT_REASON_KEYWORDS = (
+    "why my payment", "why was my payment", "payment failed", "unsuccessful payment",
+    "payment unsuccessful", "payment declined", "why did my payment fail",
+    "why payment failed", "payment issue", "payment problem", "card declined",
+    "stripe decline", "why was it declined", "why was it cancelled", "why it failed",
+    "why did it fail", "why didn't it go through", "why it didn’t go through",
+    "why was my order payment", "explain my payment"
+)
+
+def is_payment_reason_query(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in _PAYMENT_REASON_KEYWORDS)
+
+def _latest_order_for_user(user_id: Optional[str]):
+    """Return the most recent order for this user (sorted by `date` desc)."""
+    if db is None or not user_id or user_id == "guest":
+        return None
+    try:
+        flt = _possible_user_id_filters(user_id)
+        if not flt:
+            return None
+        doc = db["orders"].find_one(
+            flt,
+            sort=[("date", -1), ("_id", -1)]
+        )
+        return doc
+    except Exception:
+        log.exception("_latest_order_for_user failed")
+        return None
+
+def _map_stripe_reason(code: str, decline_code: str = "", fallback: str = "") -> str:
+    """Human-friendly reason from stored Stripe codes."""
+    code_n = _n(code)
+    decline_n = _n(decline_code)
+    if decline_n and decline_n in STRIPE_ERRORS["decline_codes"]:
+        return STRIPE_ERRORS["decline_codes"][decline_n]
+    if code_n and code_n in STRIPE_ERRORS["codes"]:
+        return STRIPE_ERRORS["codes"][code_n]
+    return fallback or "The payment didn’t complete. Please try again, use a different card, or contact your bank."
+
+def _explain_payment_outcome(order: dict) -> str:
+    """Build a concise explanation string for the user's latest payment outcome."""
+    if not order:
+        return "I couldn’t find any payments on your account yet."
+
+    when = _fmt_date(order.get("date") or order.get("dt") or order.get("created_at"))
+    amt = order.get("amount")
+    try:
+        amt_str = f"${int(float(amt))}" if float(amt).is_integer() else f"${float(amt):.2f}"
+    except Exception:
+        amt_str = f"${amt}" if amt is not None else ""
+
+    pinfo = order.get("paymentInfo") or {}
+    status = (pinfo.get("status") or "").strip().lower()  # 'succeeded' | 'failed'
+    success_msg = (pinfo.get("successMessage") or "").strip()
+    err_code = (pinfo.get("errorCode") or "").strip()
+    err_msg = (pinfo.get("errorMessage") or "").strip()
+
+    # Try to recover decline_code from errorMessage (optional)
+    decline_code = ""
+    m = re.search(r"decline[_\s-]?code\s*[:=]\s*([a-zA-Z0-9_ -]+)", err_msg, re.I)
+    if m:
+        decline_code = _n(m.group(1))
+
+    if status == "succeeded":
+        base = f"Your most recent payment on {when} for {amt_str} was **successful**."
+        if success_msg:
+            return f"{base} {success_msg}"
+        return base
+
+    if status == "failed":
+        reason = _map_stripe_reason(err_code, decline_code=decline_code, fallback=err_msg)
+        if err_code:
+            return f"Your most recent payment on {when} for {amt_str} was **unsuccessful**. Reason: **{err_code}** — {reason}"
+        return f"Your most recent payment on {when} for {amt_str} was **unsuccessful**. {reason}"
+
+    return f"I found an order on {when} for {amt_str}, but I couldn’t confirm the payment status yet."
+
+# ---------------- Stripe text intent (existing) ----------------
+def is_stripe_query(text: str) -> bool:
+    t = (text or "").lower()
+    if "stripe" in t or "payment_intent" in t or "setup_intent" in t:
+        return True
+    if "decline_code" in t or "card_declined" in t:
+        return True
+    for kw in ("error:", "code:", "type:", "payment_method", "3ds", "3d secure", "authentication_required"):
+        if kw in t:
+            return True
+    for key in list(STRIPE_ERRORS["types"].keys()) + list(STRIPE_ERRORS["codes"].keys()) + list(STRIPE_ERRORS["decline_codes"].keys()):
+        if key.replace("_", " ") in t or key in t:
+            return True
+    return False
+
+def explain_stripe_error(text: str) -> str:
+    t = (text or "")
+    low = t.lower()
+    found_types, found_codes, found_declines, found_statuses = [], [], [], []
+
+    for k in STRIPE_ERRORS["types"]:
+        if k in low: found_types.append(k)
+    for k in STRIPE_ERRORS["codes"]:
+        if k in low: found_codes.append(k)
+    for k in STRIPE_ERRORS["decline_codes"]:
+        if k in low: found_declines.append(k)
+    for k in STRIPE_ERRORS["intents"]:
+        if k in low: found_statuses.append(k)
+
+    for m in re.finditer(r'(type|code|decline_code)\s*["\':]\s*["\']?([a-zA-Z0-9_\-]+)', t):
+        field = _n(m.group(1)); val = _n(m.group(2))
+        if field == "type" and val in STRIPE_ERRORS["types"] and val not in found_types: found_types.append(val)
+        elif field == "code" and val in STRIPE_ERRORS["codes"] and val not in found_codes: found_codes.append(val)
+        elif field == "decline_code" and val in STRIPE_ERRORS["decline_codes"] and val not in found_declines: found_declines.append(val)
+
+    lines: List[str] = []
+    if ("card_declined" in found_codes or "card_error" in found_types) and found_declines:
+        dc = found_declines[0]; lines.append(f"Stripe says **card_declined / {dc}** — {STRIPE_ERRORS['decline_codes'][dc]}")
+    if found_codes and not lines:
+        c = found_codes[0]; lines.append(f"Stripe **{c}** — {STRIPE_ERRORS['codes'][c]}")
+    if found_types and not lines:
+        ty = found_types[0]; lines.append(f"Stripe **{ty}** — {STRIPE_ERRORS['types'][ty]}")
+    if found_statuses:
+        st = found_statuses[0]; lines.append(f"Status **{st}** — {STRIPE_ERRORS['intents'][st]}")
+
+    if not lines:
+        lines = [
+            "I can help with Stripe errors. If you paste the JSON (type / code / decline_code), I’ll decode it.",
+        ]
+    lines.append("Next steps: confirm the exact error fields, retry only idempotently, or collect a new payment method / contact bank if it’s a decline.")
+    reply = " ".join(lines)
+    return (reply[:900].rstrip() + "…") if len(reply) > 900 else reply
+
 # ---------------- API Models ----------------
 class ChatReq(BaseModel):
     message: str = Field(..., min_length=1, max_length=MAX_MSG_LEN)
@@ -746,7 +797,7 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.6.9")
+app = FastAPI(title="Tomato Chatbot API", version="1.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -825,7 +876,7 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.6.9",
+        "version": "1.7.0",
         "force_llm": FORCE_LLM,
     }
 
@@ -852,11 +903,33 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
     if response is not None:
         response.headers["X-Echo-UserId"] = str(user_id or "")
 
+    # Decode raw Stripe errors pasted by user
     if is_stripe_query(user_msg):
         reply = explain_stripe_error(user_msg)
         if response is not None:
             response.headers["X-Answer-Source"] = "rule:stripe"
         return ChatResp(reply=reply)
+
+    # ---- NEW: "Why was my payment successful/unsuccessful?" intent ----
+    if is_payment_reason_query(user_msg):
+        if not user_id or user_id == "guest":
+            text = "Please log in so I can check your recent payments. Once you’re signed in, ask again."
+            if response is not None:
+                response.headers["X-Answer-Source"] = "rule:pay_reason_login_required"
+            return ChatResp(reply=text)
+
+        last = _latest_order_for_user(user_id)
+        if not last:
+            text = "I couldn’t find any payments on your account yet."
+            if response is not None:
+                response.headers["X-Answer-Source"] = "rule:pay_reason_none"
+            return ChatResp(reply=text)
+
+        text = _explain_payment_outcome(last)
+        if response is not None:
+            response.headers["X-Answer-Source"] = "rule:pay_reason_from_db"
+            response.headers["X-Order-Id"] = str(last.get("_id"))
+        return ChatResp(reply=text)
 
     # ---- Previous orders (DETAILED with normalized date) ----
     if is_previous_orders_query(user_msg):
@@ -924,14 +997,14 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
     cat = category_from_query(user_msg)
     if cat:
         fetch_map = {
-            "sandwich": get_sandwich_names,
-            "rolls":    get_rolls_names,
-            "salad":    get_salad_names,
-            "desserts": get_desserts_names,
-            "cake":     get_cake_names,
-            "pasta":    get_pasta_names,
-            "noodles":  get_noodles_names,
-            "veg":      get_veg_names,
+            "sandwich": lambda limit=20: _names_for("sandwich", limit),
+            "rolls":    lambda limit=20: _names_for("rolls", limit),
+            "salad":    lambda limit=20: _names_for("salad", limit),
+            "desserts": lambda limit=20: _names_for("desserts", limit),
+            "cake":     lambda limit=20: _names_for("cake", limit),
+            "pasta":    lambda limit=20: _names_for("pasta", limit),
+            "noodles":  lambda limit=20: _names_for("noodles", limit),
+            "veg":      lambda limit=20: _names_for("veg", limit),
         }
         fetcher = fetch_map.get(cat)
         if fetcher:
