@@ -7,7 +7,7 @@ const Verify = () => {
   const [searchParams] = useSearchParams();
   const orderId = searchParams.get('orderId');
   const sessionId = searchParams.get('session_id');
-  const { url, setCartItems } = useContext(StoreContext); 
+  const { url, setCartItems } = useContext(StoreContext);
   const navigate = useNavigate();
   const [message, setMessage] = useState('Confirming your payment…');
 
@@ -24,7 +24,7 @@ const Verify = () => {
       });
 
       if (data?.success) {
-        // clear client-side cart immediately
+        // clear client-side cart for instant UX
         setCartItems({});
         setMessage('Payment successful! Redirecting…');
         setTimeout(() => navigate('/myorders'), 600);
@@ -37,7 +37,7 @@ const Verify = () => {
       setMessage('Could not verify payment. Returning to cart…');
       setTimeout(() => navigate('/cart'), 1000);
     }
-  }, [orderId, sessionId, url, navigate, clearCart]);
+  }, [orderId, sessionId, url, navigate, setCartItems]);
 
   useEffect(() => {
     verifyPayment();
