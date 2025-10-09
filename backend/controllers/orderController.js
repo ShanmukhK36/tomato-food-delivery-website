@@ -68,7 +68,7 @@ const placeOrder = async (req, res) => {
 };
 
 // UX helper: On redirect, confirm real status with Stripe.
-// Persist SUCCESS here. Do NOT persist failure (webhook is authoritative).
+// ✅ Persist SUCCESS here and clear the cart. ❌ Do NOT persist failure (webhook is authoritative).
 const verifyOrder = async (req, res) => {
   try {
     const { orderId, session_id } = req.query;
@@ -85,7 +85,7 @@ const verifyOrder = async (req, res) => {
     let paymentStatus = session.payment_status; // 'paid' | 'unpaid' | 'no_payment_required'
     let paymentIntent = session.payment_intent;
 
-    // If not paid yet, brief retry to reduce race vs webhook
+    // Brief retry to reduce race with webhook
     if (paymentStatus !== "paid") {
       await new Promise((r) => setTimeout(r, 1200));
       session = await fetchSession();
@@ -99,23 +99,32 @@ const verifyOrder = async (req, res) => {
           ? paymentIntent.latest_charge.id
           : "";
 
-      await orderModel.findByIdAndUpdate(orderId, {
-        $set: {
-          payment: true,
-          status: "PAID",
-          "paymentInfo.status": "succeeded",
-          "paymentInfo.successMessage": "Payment succeeded.",
-          "paymentInfo.stripe.paymentIntentId": paymentIntent?.id || "",
-          "paymentInfo.stripe.chargeId": chargeId,
-          "paymentInfo.paidAt": new Date(),
+      // Persist success
+      const updatedOrder = await orderModel.findByIdAndUpdate(
+        orderId,
+        {
+          $set: {
+            payment: true,
+            status: "PAID",
+            "paymentInfo.status": "succeeded",
+            "paymentInfo.successMessage": "Payment succeeded.",
+            "paymentInfo.stripe.paymentIntentId": paymentIntent?.id || "",
+            "paymentInfo.stripe.chargeId": chargeId,
+            "paymentInfo.paidAt": new Date(),
+          },
         },
-      });
+        { new: true }
+      );
+
+      // Clear the user's cart (frontend UX fallback; webhook also clears)
+      if (updatedOrder?.userId) {
+        await userModel.findByIdAndUpdate(updatedOrder.userId, { cartData: {} });
+      }
 
       return res.json({ success: true, message: "Payment Successful" });
     }
 
-    // Not paid yet / user canceled / still processing:
-    // DO NOT persist failure here — webhook will set final state.
+    // Not paid / canceled / still processing — do NOT persist failure here.
     return res.json({
       success: false,
       message: "Payment not confirmed yet. We'll update your order automatically.",
