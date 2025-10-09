@@ -1,48 +1,43 @@
 import { useContext, useEffect, useState, useCallback } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { StoreContext } from '../context/StoreContext';
-import '../index.css';
 import axios from 'axios';
 
 const Verify = () => {
   const [searchParams] = useSearchParams();
   const orderId = searchParams.get('orderId');
-  const sessionId = searchParams.get('session_id'); // ✅ Stripe adds this in success_url/cancel_url
-  const { url } = useContext(StoreContext);
+  const sessionId = searchParams.get('session_id');
+  const { url, setCartItems } = useContext(StoreContext); 
   const navigate = useNavigate();
   const [message, setMessage] = useState('Confirming your payment…');
 
   const verifyPayment = useCallback(async () => {
-    // If we somehow didn't get the session_id, just send the user to orders
     if (!orderId || !sessionId) {
       setMessage('Missing payment information. Redirecting…');
-      setTimeout(() => navigate('/myorders'), 1200);
+      setTimeout(() => navigate('/cart'), 1000);
       return;
     }
 
     try {
-      // ✅ Backend verify is a GET that reads req.query (orderId & session_id)
-      const { data } = await axios.get(
-        `${url}/api/order/verify`,
-        { params: { orderId, session_id: sessionId } }
-      );
+      const { data } = await axios.get(`${url}/api/order/verify`, {
+        params: { orderId, session_id: sessionId },
+      });
 
       if (data?.success) {
-        // Success is persisted immediately
-        setMessage('Payment successful! Redirecting to your orders…');
-        setTimeout(() => navigate('/myorders'), 800);
+        // clear client-side cart immediately
+        setCartItems({});
+        setMessage('Payment successful! Redirecting…');
+        setTimeout(() => navigate('/myorders'), 600);
       } else {
-        // Not yet paid or canceled — DO NOT persist failure here.
-        // Webhook will update the DB authoritatively if/when Stripe completes.
-        setMessage('Waiting for Stripe confirmation…');
-        // Give the webhook a moment, then send the user to My Orders
-        setTimeout(() => navigate('/myorders'), 1500);
+        // do NOT clear cart on failure
+        setMessage('Payment not confirmed. Returning to cart…');
+        setTimeout(() => navigate('/cart'), 1000);
       }
     } catch (err) {
-      setMessage('Could not verify payment. Redirecting…');
-      setTimeout(() => navigate('/myorders'), 1200);
+      setMessage('Could not verify payment. Returning to cart…');
+      setTimeout(() => navigate('/cart'), 1000);
     }
-  }, [orderId, sessionId, url, navigate]);
+  }, [orderId, sessionId, url, navigate, clearCart]);
 
   useEffect(() => {
     verifyPayment();

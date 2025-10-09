@@ -27,7 +27,6 @@ const StoreContextProvider = (props) => {
             await axios.post(url+'/api/cart/remove', {itemId}, {headers: {token}});
         }
     }
-    
     const getTotalCartValue = () => {
         let totalAmount = 0;
         for(const item in cartItems) {
