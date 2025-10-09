@@ -9,7 +9,7 @@ orderRouter.post('/verify', verifyOrder);
 orderRouter.post('/userorders', authMiddleware, userOrders);
 orderRouter.get('/list', listOrders);
 orderRouter.post('/status', updateStatus);
-orderRouter.post('/webhook', handleStripeWebhook);
+orderRouter.post('/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
 orderRouter.post('/reconcile/:orderId', authMiddleware, reconcileOrder);
 
 export default orderRouter;
