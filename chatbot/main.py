@@ -158,7 +158,7 @@ def is_stripe_query(text: str) -> bool:
     t = (text or "").lower()
     if "stripe" in t or "payment_intent" in t or "setup_intent" in t:
         return True
-    if "decline_code" in t or "card_declined" in t:
+    if "decline_code" in t or "card_declined" in t or "declined" in t:
         return True
     for kw in ("error:", "code:", "type:", "payment_method", "3ds", "3d secure", "authentication_required"):
         if kw in t:
@@ -528,6 +528,131 @@ def get_user_recent_orders_detailed(user_id: Optional[str], limit=MAX_RECENT):
         log.exception("get_user_recent_orders_detailed failed")
         return []
 
+# -------- Last payment / transaction helpers --------
+_PAYMENT_STATUS_KEYWORDS = (
+    "why my previous transaction got failed",
+    "why did my previous transaction fail",
+    "why did my payment fail",
+    "payment failed",
+    "transaction failed",
+    "last payment",
+    "previous payment",
+    "previous transaction",
+    "payment status",
+    "was my payment successful",
+    "did my payment go through",
+    "stripe failure",
+    "declined payment",
+    "3ds failed",
+)
+
+def is_payment_status_query(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in _PAYMENT_STATUS_KEYWORDS)
+
+def _pick_dt(d):
+    """Pick best datetime field from an order doc."""
+    return d.get("date") or d.get("order_date") or d.get("created_at")
+
+def get_user_last_order_with_payment(user_id: Optional[str]) -> Optional[dict]:
+    """Returns the most recent order for the user with payment fields."""
+    if db is None or not user_id or user_id == "guest":
+        return None
+    try:
+        flt = _possible_user_id_filters(user_id)
+        if not flt:
+            return None
+        pipeline = [
+            {"$match": flt},
+            {"$addFields": {"_dt": {"$ifNull": ["$date", {"$ifNull": ["$order_date", "$created_at"]}]}}},
+            {"$sort": {"_dt": -1, "_id": -1}},
+            {"$limit": 1},
+            {"$project": {
+                "_id": 1,
+                "order_id": 1,
+                "items": 1,
+                "amount": 1,
+                "status": 1,
+                "payment": 1,
+                "paymentInfo": 1,
+                "date": 1,
+                "order_date": 1,
+                "created_at": 1,
+            }},
+        ]
+        rows = list(db["orders"].aggregate(pipeline))
+        return rows[0] if rows else None
+    except Exception:
+        log.exception("get_user_last_order_with_payment failed")
+        return None
+
+def explain_last_order_payment(order: dict) -> str:
+    """
+    Summarize last order payment result.
+    - If success → short success message with amount & time.
+    - If failed → decode Stripe error using explain_stripe_error().
+    """
+    if not order:
+        return "I couldn’t find a previous transaction for your account yet."
+
+    amt = order.get("amount")
+    dt_raw = _pick_dt(order) or ((order.get("paymentInfo", {}) or {}).get("stripe", {}) or {}).get("paidAt")
+    dt = to_safe_dt(dt_raw)
+    when = dt.strftime("%b %d, %Y %H:%M %Z") if dt else "unknown time"
+
+    paid_flag = bool(order.get("payment"))
+    status = (order.get("status") or "").strip().upper()
+
+    stripe = (order.get("paymentInfo", {}) or {}).get("stripe", {}) or {}
+    stripe_status = (stripe.get("status") or "").strip().lower()
+    err_code = (stripe.get("errorCode") or "").strip()
+    err_msg = (stripe.get("errorMessage") or "").strip()
+    sess_id = (stripe.get("sessionId") or "").strip()
+    intent_id = (stripe.get("paymentIntentId") or "").strip()
+
+    # Heuristic for success
+    is_success = (
+        paid_flag
+        or status in ("PAID", "COMPLETED", "FULFILLED")
+        or stripe_status == "succeeded"
+    )
+
+    if is_success:
+        parts = [f"Your last payment was successful"]
+        if amt is not None:
+            try:
+                parts.append(f"for ${int(float(amt)) if float(amt).is_integer() else float(amt)}")
+            except Exception:
+                parts.append(f"for ${amt}")
+        parts.append(f"on {when}.")
+        tail_bits = []
+        if intent_id:
+            tail_bits.append(f"intent {intent_id[:8]}…")
+        if sess_id:
+            tail_bits.append(f"session {sess_id[:8]}…")
+        if tail_bits:
+            parts.append("(" + ", ".join(tail_bits) + ")")
+        return " ".join(parts)
+
+    # Failure: try to decode via our existing Stripe knowledge
+    probe = []
+    if err_code:
+        probe.append(f"code: {err_code}")
+    if err_msg:
+        probe.append(err_msg)
+    if stripe_status:
+        probe.append(f"status: {stripe_status}")
+
+    # Fall back to top-level status if nothing else
+    if not probe and status:
+        probe.append(f"status: {status.lower()}")
+
+    if not probe:
+        return ("It looks like the last payment did not succeed. "
+                "Please try another card or contact your bank, and you can try again.")
+
+    return explain_stripe_error(" | ".join(probe))
+
 # Category helpers
 def get_sandwich_names(limit=20): return _names_for("sandwich", limit)
 def get_rolls_names(limit=20):    return _names_for("rolls", limit)
@@ -851,6 +976,22 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
 
     if response is not None:
         response.headers["X-Echo-UserId"] = str(user_id or "")
+
+    # ---- Last payment / previous transaction status ----
+    if is_payment_status_query(user_msg):
+        if not user_id or user_id == "guest":
+            text = "Please log in to check your last transaction status. Once signed in, ask again."
+            if response is not None:
+                response.headers["X-Answer-Source"] = "rule:payment_login_required"
+            return ChatResp(reply=text)
+
+        last = get_user_last_order_with_payment(user_id)
+        msg = explain_last_order_payment(last)
+        if response is not None:
+            response.headers["X-Answer-Source"] = "rule:payment_last_summary"
+            if last and last.get("status"):
+                response.headers["X-Last-Order-Status"] = str(last.get("status"))
+        return ChatResp(reply=msg)
 
     if is_stripe_query(user_msg):
         reply = explain_stripe_error(user_msg)
