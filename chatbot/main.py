@@ -26,28 +26,28 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tomatoai")
 
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_TIMEOUT  = float(os.getenv("OPENAI_TIMEOUT", "10"))
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_TIMEOUT_S = float(os.getenv("OPENAI_TIMEOUT", "10"))  # used per-request
 OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "300"))
 
-SHARED_SECRET   = os.getenv("SHARED_SECRET", "dev-secret")
+SHARED_SECRET    = os.getenv("SHARED_SECRET", "dev-secret")
 
-MONGO_URI       = os.getenv("MONGO_URI")
-DB_NAME         = os.getenv("DB_NAME", "food-delivery")
+MONGO_URI        = os.getenv("MONGO_URI")
+DB_NAME          = os.getenv("DB_NAME", "food-delivery")
 
-USE_MEMORY      = os.getenv("USE_MEMORY", "0") == "1"
-FORCE_LLM       = os.getenv("FORCE_LLM", "0") == "1"
+USE_MEMORY       = os.getenv("USE_MEMORY", "0") == "1"
+FORCE_LLM        = os.getenv("FORCE_LLM", "0") == "1"
 
 FRONTEND_ORIGINS = [o.strip() for o in (os.getenv("ALLOWED_ORIGINS") or "").split(",") if o.strip()]
 if not FRONTEND_ORIGINS:
     FRONTEND_ORIGINS = ["*"]
 
-# OpenAI client (safe init)
+# OpenAI client (correct for 1.x SDK)
 client = None
 if OPENAI_API_KEY:
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT)
+        client = OpenAI(api_key=OPENAI_API_KEY)
     except Exception as e:
         log.exception("OpenAI client init failed: %s", e)
         client = None
@@ -476,6 +476,26 @@ def get_user_recent_orders_detailed(user_id: Optional[str], limit=MAX_RECENT):
         log.exception("get_user_recent_orders_detailed failed")
         return []
 
+# -------- Category helpers (RESTORED) --------
+SYNONYMS = {
+    "sub": "sandwich", "subs": "sandwich", "hoagie": "sandwich",
+    "wrap": "rolls", "wraps": "rolls",
+    "desert": "desserts", "deserts": "desserts",
+    "pure veg": "veg",
+}
+def category_from_query(text: str) -> Optional[str]:
+    lower = (text or "").lower()
+    for raw in ("sandwich", "roll", "rolls", "salad", "dessert", "desserts", "cake", "pasta", "noodle", "noodles", "veg", "pure veg"):
+        if raw in lower:
+            if raw == "roll": return "rolls"
+            if raw == "dessert": return "desserts"
+            if raw == "pure veg": return "veg"
+            return raw.rstrip("s")
+    for alias, canon in SYNONYMS.items():
+        if alias in lower:
+            return canon
+    return None
+
 # -------- Popularity helpers --------
 POPULAR_KEYWORDS = ("popular", "best", "bestseller", "most ordered", "most-ordered", "top", "famous", "hot")
 
@@ -502,8 +522,7 @@ def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> Lis
                             {"$match": {"$expr": {"$and": [
                                 {"$eq": [{"$toLower": "$name"}, {"$toLower": "$$itemName"}]},
                                 {"$eq": [{"$toLower": "$category"}, cat_lower]},
-                            ]}}},
-                            {"$project": {"_id": 0, "name": 1}},
+                            ]}}}
                         ],
                         "as": "food"
                     }
@@ -568,7 +587,9 @@ SYSTEM_PROMPT = (
 )
 
 def llm_compose(system_prompt: str, content: str) -> str:
+    """Use OpenAI to compose the final reply. Falls back to draft on errors."""
     if client is None:
+        # No key → return user content (or a safe fallback)
         return content
     try:
         r = client.chat.completions.create(
@@ -577,8 +598,9 @@ def llm_compose(system_prompt: str, content: str) -> str:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": content},
             ],
-            temperature=0.2,  # tighter to avoid irrelevant outputs
+            temperature=0.2,
             max_tokens=OPENAI_MAX_TOKENS,
+            request_timeout=OPENAI_TIMEOUT_S,
         )
         out = (r.choices[0].message.content or "").strip()
         return out or content
@@ -656,7 +678,7 @@ def is_previous_orders_query(text: str) -> bool:
     t = (text or "").lower()
     return any(k in t for k in _PREV_ORDERS_KEYWORDS)
 
-# ---------------- Payment reason helpers (NEW) ----------------
+# ---------------- Payment reason helpers ----------------
 _PAYMENT_REASON_KEYWORDS = (
     "why my payment", "why was my payment", "payment failed", "unsuccessful payment",
     "payment unsuccessful", "payment declined", "why did my payment fail",
@@ -665,7 +687,6 @@ _PAYMENT_REASON_KEYWORDS = (
     "why did it fail", "why didn't it go through", "why it didn’t go through",
     "why was my order payment", "explain my payment"
 )
-
 def is_payment_reason_query(text: str) -> bool:
     t = (text or "").lower()
     return any(k in t for k in _PAYMENT_REASON_KEYWORDS)
@@ -678,10 +699,7 @@ def _latest_order_for_user(user_id: Optional[str]):
         flt = _possible_user_id_filters(user_id)
         if not flt:
             return None
-        doc = db["orders"].find_one(
-            flt,
-            sort=[("date", -1), ("_id", -1)]
-        )
+        doc = db["orders"].find_one(flt, sort=[("date", -1), ("_id", -1)])
         return doc
     except Exception:
         log.exception("_latest_order_for_user failed")
@@ -722,20 +740,18 @@ def _explain_payment_outcome(order: dict) -> str:
         decline_code = _n(m.group(1))
 
     if status == "succeeded":
-        base = f"Your most recent payment on {when} for {amt_str} was **successful**."
-        if success_msg:
-            return f"{base} {success_msg}"
-        return base
+        base = f"Your most recent payment on {when} for {amt_str} was successful."
+        return f"{base} {success_msg}".strip()
 
     if status == "failed":
         reason = _map_stripe_reason(err_code, decline_code=decline_code, fallback=err_msg)
         if err_code:
-            return f"Your most recent payment on {when} for {amt_str} was **unsuccessful**. Reason: **{err_code}** — {reason}"
-        return f"Your most recent payment on {when} for {amt_str} was **unsuccessful**. {reason}"
+            return f"Your most recent payment on {when} for {amt_str} was unsuccessful. Reason: {err_code} — {reason}"
+        return f"Your most recent payment on {when} for {amt_str} was unsuccessful. {reason}"
 
     return f"I found an order on {when} for {amt_str}, but I couldn’t confirm the payment status yet."
 
-# ---------------- Stripe text intent (existing) ----------------
+# ---------------- Stripe text intent (decode pasted errors) ----------------
 def is_stripe_query(text: str) -> bool:
     t = (text or "").lower()
     if "stripe" in t or "payment_intent" in t or "setup_intent" in t:
@@ -772,19 +788,17 @@ def explain_stripe_error(text: str) -> str:
 
     lines: List[str] = []
     if ("card_declined" in found_codes or "card_error" in found_types) and found_declines:
-        dc = found_declines[0]; lines.append(f"Stripe says **card_declined / {dc}** — {STRIPE_ERRORS['decline_codes'][dc]}")
+        dc = found_declines[0]; lines.append(f"Stripe says card_declined / {dc} — {STRIPE_ERRORS['decline_codes'][dc]}")
     if found_codes and not lines:
-        c = found_codes[0]; lines.append(f"Stripe **{c}** — {STRIPE_ERRORS['codes'][c]}")
+        c = found_codes[0]; lines.append(f"Stripe {c} — {STRIPE_ERRORS['codes'][c]}")
     if found_types and not lines:
-        ty = found_types[0]; lines.append(f"Stripe **{ty}** — {STRIPE_ERRORS['types'][ty]}")
+        ty = found_types[0]; lines.append(f"Stripe {ty} — {STRIPE_ERRORS['types'][ty]}")
     if found_statuses:
-        st = found_statuses[0]; lines.append(f"Status **{st}** — {STRIPE_ERRORS['intents'][st]}")
+        st = found_statuses[0]; lines.append(f"Status {st} — {STRIPE_ERRORS['intents'][st]}")
 
     if not lines:
-        lines = [
-            "I can help with Stripe errors. If you paste the JSON (type / code / decline_code), I’ll decode it.",
-        ]
-    lines.append("Next steps: confirm the exact error fields, retry only idempotently, or collect a new payment method / contact bank if it’s a decline.")
+        lines = ["I can help with Stripe errors. Paste the JSON (type / code / decline_code) and I’ll decode it."]
+    lines.append("Next: confirm exact fields, retry idempotently, or try another payment method / bank if it’s a decline.")
     reply = " ".join(lines)
     return (reply[:900].rstrip() + "…") if len(reply) > 900 else reply
 
@@ -797,7 +811,7 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.7.0")
+app = FastAPI(title="Tomato Chatbot API", version="1.7.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -876,7 +890,7 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.7.0",
+        "version": "1.7.1",
         "force_llm": FORCE_LLM,
     }
 
@@ -899,45 +913,49 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
 
     user_id = req.userId or None
     req_id = getattr(request.state, "req_id", "n/a")
-
     if response is not None:
         response.headers["X-Echo-UserId"] = str(user_id or "")
 
-    # Decode raw Stripe errors pasted by user
+    # 1) Decode raw Stripe error JSON pasted by the user (LLM explains codes)
     if is_stripe_query(user_msg):
-        reply = explain_stripe_error(user_msg)
+        draft = explain_stripe_error(user_msg)
+        final = llm_compose(SYSTEM_PROMPT, f"Rewrite succinctly for a customer:\n{draft}")
         if response is not None:
-            response.headers["X-Answer-Source"] = "rule:stripe"
-        return ChatResp(reply=reply)
+            response.headers["X-Answer-Source"] = "rule:stripe+llm"
+        return ChatResp(reply=final)
 
-    # ---- NEW: "Why was my payment successful/unsuccessful?" intent ----
+    # 2) "Why was my payment successful/unsuccessful?"
     if is_payment_reason_query(user_msg):
         if not user_id or user_id == "guest":
             text = "Please log in so I can check your recent payments. Once you’re signed in, ask again."
+            final = llm_compose(SYSTEM_PROMPT, text)
             if response is not None:
                 response.headers["X-Answer-Source"] = "rule:pay_reason_login_required"
-            return ChatResp(reply=text)
+            return ChatResp(reply=final)
 
         last = _latest_order_for_user(user_id)
         if not last:
             text = "I couldn’t find any payments on your account yet."
+            final = llm_compose(SYSTEM_PROMPT, text)
             if response is not None:
                 response.headers["X-Answer-Source"] = "rule:pay_reason_none"
-            return ChatResp(reply=text)
+            return ChatResp(reply=final)
 
-        text = _explain_payment_outcome(last)
+        db_expl = _explain_payment_outcome(last)
+        final = llm_compose(SYSTEM_PROMPT, f"Explain this to the customer in one or two short sentences:\n{db_expl}")
         if response is not None:
-            response.headers["X-Answer-Source"] = "rule:pay_reason_from_db"
+            response.headers["X-Answer-Source"] = "rule:pay_reason_from_db+llm"
             response.headers["X-Order-Id"] = str(last.get("_id"))
-        return ChatResp(reply=text)
+        return ChatResp(reply=final)
 
-    # ---- Previous orders (DETAILED with normalized date) ----
+    # 3) Previous orders list
     if is_previous_orders_query(user_msg):
         if not user_id or user_id == "guest":
             text = "To show your past orders, please log in. Once you’re signed in, ask “show my recent orders.”"
+            final = llm_compose(SYSTEM_PROMPT, text)
             if response is not None:
                 response.headers["X-Answer-Source"] = "rule:orders_login_required"
-            return ChatResp(reply=text)
+            return ChatResp(reply=final)
 
         detailed = get_user_recent_orders_detailed(user_id, limit=MAX_RECENT)
         if detailed:
@@ -948,18 +966,20 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                 tail = f"(id {_short_id(o.get('order_id'))})" if o.get("order_id") is not None else ""
                 lines.append(f"• {when} — {total_qty} items: {preview} {tail}".rstrip())
             text = "\n".join(lines)
+            final = llm_compose(SYSTEM_PROMPT, text)
             if response is not None:
-                response.headers["X-Answer-Source"] = "rule:orders_list_detailed"
+                response.headers["X-Answer-Source"] = "rule:orders_list_detailed+llm"
                 response.headers["X-Orders-Count"] = str(len(detailed))
-            return ChatResp(reply=text)
+            return ChatResp(reply=final)
 
         text = "I couldn’t find past orders for your account yet. You can place an order and I’ll track it here."
+        final = llm_compose(SYSTEM_PROMPT, text)
         if response is not None:
-            response.headers["X-Answer-Source"] = "rule:orders_none"
+            response.headers["X-Answer-Source"] = "rule:orders_none+llm"
             response.headers["X-Orders-Count"] = "0"
-        return ChatResp(reply=text)
+        return ChatResp(reply=final)
 
-    # ---- Popularity questions (guarded LLM) ----
+    # 4) Popularity questions (use data; let LLM phrase)
     if is_popularity_query(user_msg):
         cat = category_from_query(user_msg)
         names = top_items_from_orders(limit=3, category=cat) or top_items_from_foods(limit=3, category=cat)
@@ -969,31 +989,30 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                 if cat else
                 "Top items customers are ordering: " + ", ".join(names) + "."
             )
-            final = guarded_rewrite(user_msg, draft) if FORCE_LLM else draft
+            final = guarded_rewrite(user_msg, draft) if FORCE_LLM else llm_compose(SYSTEM_PROMPT, draft)
             if response is not None:
-                response.headers["X-Answer-Source"] = "rule+llm:popularity" if FORCE_LLM else "rule:popularity"
+                response.headers["X-Answer-Source"] = "rule+llm:popularity"
             return ChatResp(reply=final)
 
-    # ---- Item detail (try by name; guarded LLM) ----
+    # 5) Item detail by name (data; LLM phrasing)
     candidates = find_item_candidates_by_name(user_msg, limit=3)
     if candidates:
-        # Multiple plausible matches → ask to clarify unless the top match is very close
         if len(candidates) > 1 and _similar(user_msg, candidates[0].get("name", "")) < 0.88:
             choices = ", ".join(c.get("name") for c in candidates)
             text = f"Did you mean: {choices}? Tell me the exact name for details."
+            final = llm_compose(SYSTEM_PROMPT, text)
             if response is not None:
-                response.headers["X-Answer-Source"] = "rule:item_disambiguate"
-            return ChatResp(reply=text)
+                response.headers["X-Answer-Source"] = "rule:item_disambiguate+llm"
+            return ChatResp(reply=final)
 
-        # Single good match → show description line
         item = candidates[0]
         draft = format_item_detail(item)
-        final = guarded_rewrite(user_msg, draft) if FORCE_LLM else draft
+        final = guarded_rewrite(user_msg, draft) if FORCE_LLM else llm_compose(SYSTEM_PROMPT, draft)
         if response is not None:
-            response.headers["X-Answer-Source"] = "rule+llm:item_detail" if FORCE_LLM else "rule:item_detail"
+            response.headers["X-Answer-Source"] = "rule:item_detail+llm"
         return ChatResp(reply=final)
 
-    # ---- Category-first answers (guarded LLM) ----
+    # 6) Category-first answers (data; LLM phrasing)
     cat = category_from_query(user_msg)
     if cat:
         fetch_map = {
@@ -1011,20 +1030,20 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             names = fetcher(limit=20)
             if names:
                 draft = f"Our {cat.rstrip('s')} options include: " + ", ".join(names[:10]) + "."
-                final = guarded_rewrite(user_msg, draft) if FORCE_LLM else draft
+                final = guarded_rewrite(user_msg, draft) if FORCE_LLM else llm_compose(SYSTEM_PROMPT, draft)
                 if response is not None:
-                    response.headers["X-Answer-Source"] = "rule+llm:category" if FORCE_LLM else "rule:category"
+                    response.headers["X-Answer-Source"] = "rule:category+llm"
                 return ChatResp(reply=final)
 
-    # ---- Build LLM context & generic fallback (still guarded) ----
+    # 7) Generic fallback with DB context (LLM answer)
     db_context = build_context(user_msg, user_id)
     draft = "How can I help with our menu, your order, or delivery?"
     content = f"{db_context}\nCustomer: {user_msg}\nDraft: {draft}\nFollow the rules above."
     answer = guarded_rewrite(user_msg, draft) if FORCE_LLM else llm_compose(SYSTEM_PROMPT, content)
     if response is not None:
-        response.headers["X-Answer-Source"] = "llm" if FORCE_LLM else "llm:plain"
+        response.headers["X-Answer-Source"] = "llm"
 
-    # ---- Persist memory (best-effort) ----
+    # Persist memory (best-effort)
     if memory and user_id:
         try:
             memory.add(user_msg, user_id=user_id, metadata={"app_id": "tomato", "role": "user"})
