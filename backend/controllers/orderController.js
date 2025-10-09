@@ -67,8 +67,8 @@ const placeOrder = async (req, res) => {
   }
 };
 
-// UX helper: on redirect, check real status with Stripe
-// Anything not 'paid' is treated as final failure here.
+// UX helper: On redirect, confirm real status with Stripe.
+// Persist SUCCESS here. Do NOT persist failure (webhook is authoritative).
 const verifyOrder = async (req, res) => {
   try {
     const { orderId, session_id } = req.query;
@@ -76,13 +76,22 @@ const verifyOrder = async (req, res) => {
       return res.json({ success: false, message: "Missing orderId or session_id" });
     }
 
-    // Fetch session and expand PI for detailed error/charge
-    const session = await stripe.checkout.sessions.retrieve(session_id, {
-      expand: ["payment_intent.latest_charge"],
-    });
+    const fetchSession = async () =>
+      await stripe.checkout.sessions.retrieve(session_id, {
+        expand: ["payment_intent.latest_charge"],
+      });
 
-    const paymentIntent = session.payment_intent;
-    const paymentStatus = session.payment_status; // 'paid' | 'unpaid' | 'no_payment_required'
+    let session = await fetchSession();
+    let paymentStatus = session.payment_status; // 'paid' | 'unpaid' | 'no_payment_required'
+    let paymentIntent = session.payment_intent;
+
+    // If not paid yet, brief retry to reduce race vs webhook
+    if (paymentStatus !== "paid") {
+      await new Promise((r) => setTimeout(r, 1200));
+      session = await fetchSession();
+      paymentStatus = session.payment_status;
+      paymentIntent = session.payment_intent;
+    }
 
     if (paymentStatus === "paid") {
       const chargeId =
@@ -105,31 +114,12 @@ const verifyOrder = async (req, res) => {
       return res.json({ success: true, message: "Payment Successful" });
     }
 
-    // Treat all other cases as final failure (from UI perspective)
-    let errorCode = "";
-    let errorMessage = "";
-
-    if (paymentIntent?.last_payment_error) {
-      errorCode = paymentIntent.last_payment_error.code || "";
-      errorMessage = paymentIntent.last_payment_error.message || "Payment failed.";
-    }
-    if (!errorCode) {
-      errorCode = "user_canceled_or_incomplete";
-      errorMessage = "Payment not completed.";
-    }
-
-    await orderModel.findByIdAndUpdate(orderId, {
-      $set: {
-        payment: false,
-        status: "Payment Failed",
-        "paymentInfo.status": "failed",
-        "paymentInfo.errorCode": errorCode,
-        "paymentInfo.errorMessage": errorMessage,
-        "paymentInfo.failedAt": new Date(),
-      },
+    // Not paid yet / user canceled / still processing:
+    // DO NOT persist failure here — webhook will set final state.
+    return res.json({
+      success: false,
+      message: "Payment not confirmed yet. We'll update your order automatically.",
     });
-
-    return res.json({ success: false, message: "Payment Unsuccessful" });
   } catch (error) {
     console.error("[verifyOrder] error:", error);
     return res.json({ success: false, message: error.message });
