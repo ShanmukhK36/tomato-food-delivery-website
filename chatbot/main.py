@@ -16,7 +16,7 @@ from openai import OpenAI, APIConnectionError, RateLimitError, APIStatusError
 from dotenv import load_dotenv
 from difflib import SequenceMatcher  # fuzzy name match
 
-# === DROP-IN: ordering imports ===
+# === ORDERING imports ===
 import requests
 from dataclasses import dataclass
 
@@ -47,7 +47,7 @@ FRONTEND_ORIGINS = [o.strip() for o in (os.getenv("ALLOWED_ORIGINS") or "").spli
 if not FRONTEND_ORIGINS:
     FRONTEND_ORIGINS = ["*"]
 
-# === DROP-IN: ordering env ===
+# === ORDERING env ===
 ORDER_API_BASE = (os.getenv("ORDER_API_BASE") or "").rstrip("/")
 USER_JWT_HEADER = os.getenv("USER_JWT_HEADER", "X-User-JWT")
 USER_COOKIE_HEADER = os.getenv("USER_COOKIE_HEADER", "X-User-Cookie")
@@ -216,7 +216,7 @@ def explain_stripe_error(text: str) -> str:
     reply = " ".join(lines)
     return (reply[:900].rstrip() + "…") if len(reply) > 900 else reply
 
-# ---------------- Seed Data (descriptions already precise) ----------------
+# ---------------- Seed Data ----------------
 STATIC_FOODS = [
     {"name": "Greek salad", "category": "salad", "price": 12, "description": "Classic Mediterranean salad; not spicy. Ingredients: cucumber, ripe tomatoes, red onion, Kalamata olives, feta, oregano, olive oil & lemon."},
     {"name": "Veg salad", "category": "salad", "price": 18, "description": "Crisp garden salad; not spicy. Ingredients: mixed greens, cucumber, tomato, carrots, sweet corn, bell peppers, light lemon-herb vinaigrette."},
@@ -794,7 +794,7 @@ def llm_compose(system_prompt: str, content: str) -> str:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": content},
             ],
-            temperature=0.2,  # tighter to avoid irrelevant outputs
+            temperature=0.2,
             max_tokens=OPENAI_MAX_TOKENS,
         )
         out = (r.choices[0].message.content or "").strip()
@@ -848,10 +848,7 @@ def build_context(user_msg: str, user_id: Optional[str]) -> str:
     return ("Database context:\n" + "\n".join(ctx_parts) + "\n") if ctx_parts else ""
 
 def guarded_rewrite(user_msg: str, draft: str) -> str:
-    """
-    Extra guardrails so the LLM never goes off-menu.
-    We feed it the exact menu list and strict rules.
-    """
+    """Guardrails so the LLM never goes off-menu."""
     menu = ", ".join(list_all_food_names())
     rules = (
         "Rules:\n"
@@ -873,7 +870,7 @@ def is_previous_orders_query(text: str) -> bool:
     t = (text or "").lower()
     return any(k in t for k in _PREV_ORDERS_KEYWORDS)
 
-# === DROP-IN: ordering client & models ===
+# === ORDER CLIENT & MODELS ===
 @dataclass
 class AddToCartPayload:
     item_id: str
@@ -904,11 +901,9 @@ class OrderClient:
             self.s.headers[USER_COOKIE_HEADER] = cookie
 
     def _url(self, p: str) -> str:
-        # ORDER_API_BASE is expected to already include /api
         return f"{self.base}{p}"
 
     def _post_try(self, candidates: List[str], json: dict, timeout: float = 8.0):
-        """Try multiple endpoints until one succeeds (2xx)."""
         last_err = None
         for p in candidates:
             try:
@@ -935,15 +930,13 @@ class OrderClient:
     # ---- CART ----
     def add_to_cart(self, payload: AddToCartPayload):
         body = {"itemId": payload.item_id, "qty": payload.qty, "modifiers": payload.modifiers or []}
-        # Common cart endpoints: /api/cart/items (preferred), or /api/cart/add
         return self._post_try(
-            candidates=["/cart/items", "/cart/add", "/cart"],  # last one for APIs that use POST /cart
+            candidates=["/cart/items", "/cart/add", "/cart"],
             json=body,
             timeout=6.0,
         )
 
     def get_cart(self):
-        # Common cart endpoints: GET /api/cart (preferred) or GET /api/cart/items
         return self._get_try(
             candidates=["/cart", "/cart/items"],
             timeout=6.0,
@@ -956,10 +949,6 @@ class OrderClient:
             "contact": payload.contact,
             "method": payload.method,
         }
-        # Likely endpoints under /api/order:
-        # - /api/order/checkout-session (Stripe Checkout)
-        # - /api/order/checkout          (generic)
-        # - /api/order                   (create order)
         return self._post_try(
             candidates=["/order/checkout-session", "/order/checkout", "/order"],
             json=body,
@@ -967,28 +956,54 @@ class OrderClient:
         )
 
     def confirm(self, payload: ConfirmPayload):
-        # If you confirm after webhooks, this may be a no-op. Keeping flexible:
-        # - /api/order/confirm
-        # - /api/order/complete
-        # - /api/order/finalize
         return self._post_try(
             candidates=["/order/confirm", "/order/complete", "/order/finalize"],
             json={"paymentIntentId": payload.payment_intent_id},
             timeout=8.0,
         )
 
-# === DROP-IN: ordering intent extraction ===
-ADD_PATTERNS = (r"\b(add|order|get|i'?ll have|i want)\b.*",)
+# === ORDERING intent extraction (multi-item support) ===
+# Patterns
 SHOW_CART_PATTERNS = (r"\b(show|view|see)\b.*\b(cart|basket)\b", r"\bwhat'?s in my cart\b")
 CHECKOUT_PATTERNS = (r"\b(check ?out|pay|proceed to payment|place (the )?order)\b",)
 CONFIRM_PATTERNS = (r"\b(confirm|finalize)\b.*\b(payment|order)\b",)
+ADD_PATTERNS = (r"\b(add|order|get|i'?ll have|i want)\b",)
 
-def extract_qty(text: str) -> int:
-    m = re.search(r"\b(\d+)\b", text or "")
-    try:
-        return max(1, int(m.group(1))) if m else 1
-    except Exception:
-        return 1
+# Multi-item parser
+ITEM_QTY_PATTERN = re.compile(
+    r"""
+    (?P<name>[A-Za-z][A-Za-z\s\-]+?)       # item name
+    (?:\s*[xX\*]\s*(?P<qty>\d{1,3}))?      # optional x 2 / * 2
+    (?=\s*(?:,|\n|and\b|&\b|$))            # stop at separators
+    """,
+    re.VERBOSE | re.IGNORECASE
+)
+
+def parse_items_with_qty(text: str):
+    out = []
+    if not text:
+        return out
+    parts = re.split(r"(?:,|\n| and | & )", text, flags=re.IGNORECASE)
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        m = ITEM_QTY_PATTERN.search(p)
+        if not m:
+            continue
+        name = (m.group("name") or "").strip(" -")
+        qty = int(m.group("qty") or 1)
+        if name:
+            out.append({"name": name, "qty": max(1, qty)})
+    return out
+
+def map_to_menu_items(requested: list):
+    results = []
+    for r in requested:
+        cands = find_item_candidates_by_name(r["name"], limit=1)
+        if cands:
+            results.append({"item_id": cands[0]["name"], "qty": r["qty"]})
+    return results
 
 def extract_payment_method(text: str) -> str:
     t = (text or "").lower()
@@ -996,7 +1011,6 @@ def extract_payment_method(text: str) -> str:
     return "card"
 
 def extract_address_and_contact_from_mem(user_id: Optional[str]):
-    # Best-effort defaults
     addr = {"line1": "", "city": "", "zip": ""}
     contact = {"name": "", "phone": "", "email": ""}
     if memory and user_id:
@@ -1017,7 +1031,7 @@ def extract_address_and_contact_from_mem(user_id: Optional[str]):
     return addr, contact
 
 def extract_action(user_msg: str) -> Optional[dict]:
-    """Return {"type": ..., "slots": {...}} or None."""
+    """Return {"type": ..., "slots": {...}} or None. Supports multi-item 'order'."""
     t = (user_msg or "").strip()
     low = t.lower()
 
@@ -1029,20 +1043,19 @@ def extract_action(user_msg: str) -> Optional[dict]:
 
     if any(re.search(p, low) for p in CONFIRM_PATTERNS):
         pid = None
-        m = re.search(r"pi_[A-Za-z0-9_]+", t)  # detect a pasted PaymentIntent
+        m = re.search(r"pi_[A-Za-z0-9_]+", t)
         if m: pid = m.group(0)
         return {"type": "confirm_order", "slots": {"payment_intent_id": pid}}
 
     if any(re.search(p, low) for p in ADD_PATTERNS):
-        cands = find_item_candidates_by_name(t, limit=3)
-        if not cands:
-            return None
-        if len(cands) > 1 and _similar(t, cands[0].get("name", "")) < 0.88:
-            return {"type": "disambiguate", "slots": {"choices": [c["name"] for c in cands]}}
-        item = cands[0]
-        qty = extract_qty(low)
-        # NOTE: using item name as "item_id" because Mongo helpers don’t expose numeric IDs
-        return {"type": "add_to_cart", "slots": {"item_id": item["name"], "quantity": qty}}
+        items_req = parse_items_with_qty(t)
+        if items_req:
+            mapped = map_to_menu_items(items_req)
+            if mapped:
+                return {"type": "add_multiple", "slots": {"items": mapped}}
+            return {"type": "disambiguate", "slots": {"choices": []}}
+        # No explicit items
+        return {"type": "prompt_for_items", "slots": {}}
 
     return None
 
@@ -1055,7 +1068,7 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.7.0-ordering")
+app = FastAPI(title="Tomato Chatbot API", version="1.8.0-ordering")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1134,7 +1147,7 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.7.0-ordering",
+        "version": "1.8.0-ordering",
         "force_llm": FORCE_LLM,
     }
 
@@ -1211,16 +1224,16 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             response.headers["X-Orders-Count"] = "0"
         return ChatResp(reply=text)
 
-    # === DROP-IN: ORDERING (cart, checkout, confirm) ===
+    # === ORDERING (cart, checkout, confirm) ===
     action = extract_action(user_msg)
     if action and ORDER_API_BASE:
         if REQUIRE_AUTH_FOR_ORDER and (not user_id or user_id == "guest"):
-            txt = "Please log in to add items or checkout. Once signed in, say “add <item>” or “checkout”."
+            txt = "Please log in to add items or checkout. Once signed in, say “Rice Zucchini x 1, Clover Salad x 2”."
             if response is not None:
                 response.headers["X-Answer-Source"] = "order:login_required"
             return ChatResp(reply=txt)
 
-        # forward user auth (if your frontend sets these headers)
+        # forward user auth
         fwd_jwt = request.headers.get(USER_JWT_HEADER, "") if request else ""
         fwd_cookie = request.headers.get(USER_COOKIE_HEADER, "") if request else ""
 
@@ -1233,26 +1246,34 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
         t = action["type"]
         slots = action.get("slots", {})
 
+        if t == "prompt_for_items":
+            if response is not None:
+                response.headers["X-Answer-Source"] = "order:prompt_items"
+            return ChatResp(reply='Tell me what to add like: “Rice Zucchini x 1, Clover Salad x 2”.')
+
+        if t == "add_multiple":
+            added = []
+            failed = []
+            for it in slots.get("items", []):
+                try:
+                    _ = oc.add_to_cart(AddToCartPayload(item_id=it["item_id"], qty=it["qty"], modifiers=[]))
+                    bump_food_orders([{"name": it["item_id"], "qty": it["qty"]}])
+                    added.append(f'{it["item_id"]} ×{it["qty"]}')
+                except Exception:
+                    failed.append(it["item_id"])
+            if response is not None:
+                response.headers["X-Answer-Source"] = "order:add_multi"
+            if added and not failed:
+                return ChatResp(reply=f"Added: {', '.join(added)}. Say “show cart” or “checkout”.")
+            if added and failed:
+                return ChatResp(reply=f"Added: {', '.join(added)}. Couldn’t add: {', '.join(failed)}. Say “show cart” or try again.")
+            return ChatResp(reply="I couldn’t add those items. Please check the names and try again.")
+
         if t == "disambiguate":
-            choices = ", ".join(slots.get("choices", [])[:5])
+            choices = ", ".join(slots.get("choices", [])[:5]) or "please share the exact item names"
             if response is not None:
                 response.headers["X-Answer-Source"] = "order:item_disambiguate"
-            return ChatResp(reply=f"Did you mean: {choices}? Tell me the exact name.")
-
-        if t == "add_to_cart":
-            try:
-                _ = oc.add_to_cart(AddToCartPayload(
-                    item_id=slots["item_id"],
-                    qty=slots.get("quantity", 1),
-                    modifiers=slots.get("modifiers", []),
-                ))
-                bump_food_orders([{"name": slots["item_id"], "qty": slots.get("quantity", 1)}])  # best-effort popularity bump
-                if response is not None:
-                    response.headers["X-Answer-Source"] = "order:add_to_cart"
-                return ChatResp(reply=f"Added {slots.get('quantity',1)} × {slots['item_id']} to your cart. Say “show cart” or “checkout”.")
-            except Exception as e:
-                log.error("add_to_cart failed: %s", e)
-                return ChatResp(reply="I couldn’t add that right now. Please try again or pick another item.")
+            return ChatResp(reply=f"Did you mean: {choices}? Tell me the exact names, e.g., “Veg Noodles x 1, Greek salad x 2”.")
 
         if t == "show_cart":
             try:
@@ -1261,7 +1282,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                 if not items:
                     if response is not None:
                         response.headers["X-Answer-Source"] = "order:cart_empty"
-                    return ChatResp(reply="Your cart is empty. Say “add <item name>”.")
+                    return ChatResp(reply="Your cart is empty. Say “add Veg Noodles x 1”.")
                 parts = []
                 for it in items[:5]:
                     nm = (it.get("name") or it.get("itemId") or 'item').strip()
@@ -1333,7 +1354,6 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
     # ---- Item detail (try by name; guarded LLM) ----
     candidates = find_item_candidates_by_name(user_msg, limit=3)
     if candidates:
-        # Multiple plausible matches → ask to clarify unless the top match is very close
         if len(candidates) > 1 and _similar(user_msg, candidates[0].get("name", "")) < 0.88:
             choices = ", ".join(c.get("name") for c in candidates)
             text = f"Did you mean: {choices}? Tell me the exact name for details."
@@ -1341,7 +1361,6 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                 response.headers["X-Answer-Source"] = "rule:item_disambiguate"
             return ChatResp(reply=text)
 
-        # Single good match → show description line
         item = candidates[0]
         draft = format_item_detail(item)
         final = guarded_rewrite(user_msg, draft) if FORCE_LLM else draft
@@ -1389,3 +1408,8 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             pass
 
     return ChatResp(reply=answer if isinstance(answer, str) else "")
+
+# Accept trailing slash to avoid 307/308 redirects returning HTML
+@app.post("/chat/", response_model=ChatResp, include_in_schema=False)
+async def chat_trailing_slash(req: ChatReq, x_service_auth: str = Header(default=""), request: Request = None, response: Response = None):
+    return await chat(req, x_service_auth, request, response)
