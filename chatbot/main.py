@@ -894,11 +894,16 @@ class OrderClient:
         self.base = base_url.rstrip("/")
         self.s = requests.Session()
         self.s.headers.update({"Accept": "application/json"})
+
         if jwt:
-            self.s.headers[USER_JWT_HEADER] = jwt
+            # keep both so either style works downstream
+            self.s.headers[USER_JWT_HEADER] = jwt           
             self.s.headers["Authorization"] = f"Bearer {jwt}"
+
         if cookie:
-            self.s.headers[USER_COOKIE_HEADER] = cookie
+            self.s.headers["Cookie"] = cookie               # ← REQUIRED
+            # keep the debug/trace header too (optional)
+            self.s.headers[USER_COOKIE_HEADER] = cookie     
 
     def _url(self, p: str) -> str:
         return f"{self.base}{p}"
