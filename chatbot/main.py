@@ -2,7 +2,7 @@ import os
 import re
 import hmac
 import logging
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
 from itertools import islice
 
@@ -15,6 +15,10 @@ from pymongo.errors import PyMongoError
 from openai import OpenAI, APIConnectionError, RateLimitError, APIStatusError
 from dotenv import load_dotenv
 from difflib import SequenceMatcher  # fuzzy name match
+
+# === DROP-IN: ordering imports ===
+import requests
+from dataclasses import dataclass
 
 try:
     from bson import ObjectId
@@ -42,6 +46,12 @@ FORCE_LLM       = os.getenv("FORCE_LLM", "0") == "1"
 FRONTEND_ORIGINS = [o.strip() for o in (os.getenv("ALLOWED_ORIGINS") or "").split(",") if o.strip()]
 if not FRONTEND_ORIGINS:
     FRONTEND_ORIGINS = ["*"]
+
+# === DROP-IN: ordering env ===
+ORDER_API_BASE = (os.getenv("ORDER_API_BASE") or "").rstrip("/")
+USER_JWT_HEADER = os.getenv("USER_JWT_HEADER", "X-User-JWT")
+USER_COOKIE_HEADER = os.getenv("USER_COOKIE_HEADER", "X-User-Cookie")
+REQUIRE_AUTH_FOR_ORDER = os.getenv("REQUIRE_AUTH_FOR_ORDER", "1") == "1"
 
 # OpenAI client (safe init)
 client = None
@@ -564,7 +574,8 @@ def get_user_last_order_with_payment(user_id: Optional[str]) -> Optional[dict]:
             return None
         pipeline = [
             {"$match": flt},
-            {"$addFields": {"_dt": {"$ifNull": ["$date", {"$ifNull": ["$order_date", "$created_at"]}]}}},
+            {"$addFields": {"_dt": {"$ifNull": ["$date", {"$ifNull": ["$order_date", "$created_at"]}]}}}
+            ,
             {"$sort": {"_dt": -1, "_id": -1}},
             {"$limit": 1},
             {"$project": {
@@ -862,6 +873,179 @@ def is_previous_orders_query(text: str) -> bool:
     t = (text or "").lower()
     return any(k in t for k in _PREV_ORDERS_KEYWORDS)
 
+# === DROP-IN: ordering client & models ===
+@dataclass
+class AddToCartPayload:
+    item_id: str
+    qty: int = 1
+    modifiers: Optional[List[Dict[str, Any]]] = None
+
+@dataclass
+class CheckoutPayload:
+    address: Dict[str, Any]
+    contact: Dict[str, Any]
+    method: str = "card"  # "card" | "cash"
+
+@dataclass
+class ConfirmPayload:
+    payment_intent_id: str
+
+class OrderClient:
+    def __init__(self, base_url: str, jwt: str = "", cookie: str = ""):
+        if not base_url:
+            raise RuntimeError("ORDER_API_BASE not configured")
+        self.base = base_url.rstrip("/")
+        self.s = requests.Session()
+        self.s.headers.update({"Accept": "application/json"})
+        if jwt:
+            self.s.headers[USER_JWT_HEADER] = jwt
+            self.s.headers["Authorization"] = f"Bearer {jwt}"
+        if cookie:
+            self.s.headers[USER_COOKIE_HEADER] = cookie
+
+    def _url(self, p: str) -> str:
+        # ORDER_API_BASE is expected to already include /api
+        return f"{self.base}{p}"
+
+    def _post_try(self, candidates: List[str], json: dict, timeout: float = 8.0):
+        """Try multiple endpoints until one succeeds (2xx)."""
+        last_err = None
+        for p in candidates:
+            try:
+                r = self.s.post(self._url(p), json=json, timeout=timeout)
+                if 200 <= r.status_code < 300:
+                    return r.json()
+                last_err = f"{r.status_code} {r.text[:200]}"
+            except Exception as e:
+                last_err = str(e)
+        raise RuntimeError(f"POST failed for {candidates}: {last_err}")
+
+    def _get_try(self, candidates: List[str], timeout: float = 8.0):
+        last_err = None
+        for p in candidates:
+            try:
+                r = self.s.get(self._url(p), timeout=timeout)
+                if 200 <= r.status_code < 300:
+                    return r.json()
+                last_err = f"{r.status_code} {r.text[:200]}"
+            except Exception as e:
+                last_err = str(e)
+        raise RuntimeError(f"GET failed for {candidates}: {last_err}")
+
+    # ---- CART ----
+    def add_to_cart(self, payload: AddToCartPayload):
+        body = {"itemId": payload.item_id, "qty": payload.qty, "modifiers": payload.modifiers or []}
+        # Common cart endpoints: /api/cart/items (preferred), or /api/cart/add
+        return self._post_try(
+            candidates=["/cart/items", "/cart/add", "/cart"],  # last one for APIs that use POST /cart
+            json=body,
+            timeout=6.0,
+        )
+
+    def get_cart(self):
+        # Common cart endpoints: GET /api/cart (preferred) or GET /api/cart/items
+        return self._get_try(
+            candidates=["/cart", "/cart/items"],
+            timeout=6.0,
+        )
+
+    # ---- ORDER / CHECKOUT ----
+    def checkout(self, payload: CheckoutPayload):
+        body = {
+            "address": payload.address,
+            "contact": payload.contact,
+            "method": payload.method,
+        }
+        # Likely endpoints under /api/order:
+        # - /api/order/checkout-session (Stripe Checkout)
+        # - /api/order/checkout          (generic)
+        # - /api/order                   (create order)
+        return self._post_try(
+            candidates=["/order/checkout-session", "/order/checkout", "/order"],
+            json=body,
+            timeout=10.0,
+        )
+
+    def confirm(self, payload: ConfirmPayload):
+        # If you confirm after webhooks, this may be a no-op. Keeping flexible:
+        # - /api/order/confirm
+        # - /api/order/complete
+        # - /api/order/finalize
+        return self._post_try(
+            candidates=["/order/confirm", "/order/complete", "/order/finalize"],
+            json={"paymentIntentId": payload.payment_intent_id},
+            timeout=8.0,
+        )
+
+# === DROP-IN: ordering intent extraction ===
+ADD_PATTERNS = (r"\b(add|order|get|i'?ll have|i want)\b.*",)
+SHOW_CART_PATTERNS = (r"\b(show|view|see)\b.*\b(cart|basket)\b", r"\bwhat'?s in my cart\b")
+CHECKOUT_PATTERNS = (r"\b(check ?out|pay|proceed to payment|place (the )?order)\b",)
+CONFIRM_PATTERNS = (r"\b(confirm|finalize)\b.*\b(payment|order)\b",)
+
+def extract_qty(text: str) -> int:
+    m = re.search(r"\b(\d+)\b", text or "")
+    try:
+        return max(1, int(m.group(1))) if m else 1
+    except Exception:
+        return 1
+
+def extract_payment_method(text: str) -> str:
+    t = (text or "").lower()
+    if "cash" in t: return "cash"
+    return "card"
+
+def extract_address_and_contact_from_mem(user_id: Optional[str]):
+    # Best-effort defaults
+    addr = {"line1": "", "city": "", "zip": ""}
+    contact = {"name": "", "phone": "", "email": ""}
+    if memory and user_id:
+        try:
+            results = memory.search(query="delivery address and contact", user_id=user_id) or {}
+            for m in take(results.get("results", []), 5):
+                s = (m.get("memory") or "")
+                low = s.lower()
+                if any(k in low for k in ("street", "st.", "ave", "apt", "zip")) and not addr["line1"]:
+                    addr["line1"] = s[:120]
+                if "@" in s and not contact["email"]:
+                    contact["email"] = s.strip()[:120]
+                phone_match = re.search(r"\b\d{7,}\b", low)
+                if phone_match and not contact["phone"]:
+                    contact["phone"] = phone_match.group(0)
+        except Exception:
+            pass
+    return addr, contact
+
+def extract_action(user_msg: str) -> Optional[dict]:
+    """Return {"type": ..., "slots": {...}} or None."""
+    t = (user_msg or "").strip()
+    low = t.lower()
+
+    if any(re.search(p, low) for p in SHOW_CART_PATTERNS):
+        return {"type": "show_cart", "slots": {}}
+
+    if any(re.search(p, low) for p in CHECKOUT_PATTERNS):
+        return {"type": "checkout", "slots": {"payment_method": extract_payment_method(low)}}
+
+    if any(re.search(p, low) for p in CONFIRM_PATTERNS):
+        pid = None
+        m = re.search(r"pi_[A-Za-z0-9_]+", t)  # detect a pasted PaymentIntent
+        if m: pid = m.group(0)
+        return {"type": "confirm_order", "slots": {"payment_intent_id": pid}}
+
+    if any(re.search(p, low) for p in ADD_PATTERNS):
+        cands = find_item_candidates_by_name(t, limit=3)
+        if not cands:
+            return None
+        if len(cands) > 1 and _similar(t, cands[0].get("name", "")) < 0.88:
+            return {"type": "disambiguate", "slots": {"choices": [c["name"] for c in cands]}}
+        item = cands[0]
+        qty = extract_qty(low)
+        # NOTE: using item name as "item_id" because Mongo helpers don’t expose numeric IDs
+        return {"type": "add_to_cart", "slots": {"item_id": item["name"], "quantity": qty}}
+
+    return None
+
 # ---------------- API Models ----------------
 class ChatReq(BaseModel):
     message: str = Field(..., min_length=1, max_length=MAX_MSG_LEN)
@@ -871,7 +1055,7 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.6.9")
+app = FastAPI(title="Tomato Chatbot API", version="1.7.0-ordering")
 
 app.add_middleware(
     CORSMiddleware,
@@ -950,7 +1134,7 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.6.9",
+        "version": "1.7.0-ordering",
         "force_llm": FORCE_LLM,
     }
 
@@ -1026,6 +1210,110 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             response.headers["X-Answer-Source"] = "rule:orders_none"
             response.headers["X-Orders-Count"] = "0"
         return ChatResp(reply=text)
+
+    # === DROP-IN: ORDERING (cart, checkout, confirm) ===
+    action = extract_action(user_msg)
+    if action and ORDER_API_BASE:
+        if REQUIRE_AUTH_FOR_ORDER and (not user_id or user_id == "guest"):
+            txt = "Please log in to add items or checkout. Once signed in, say “add <item>” or “checkout”."
+            if response is not None:
+                response.headers["X-Answer-Source"] = "order:login_required"
+            return ChatResp(reply=txt)
+
+        # forward user auth (if your frontend sets these headers)
+        fwd_jwt = request.headers.get(USER_JWT_HEADER, "") if request else ""
+        fwd_cookie = request.headers.get(USER_COOKIE_HEADER, "") if request else ""
+
+        try:
+            oc = OrderClient(ORDER_API_BASE, jwt=fwd_jwt, cookie=fwd_cookie)
+        except Exception as e:
+            log.error("OrderClient init failed: %s", e)
+            return ChatResp(reply="Ordering is temporarily unavailable. Please try again shortly.")
+
+        t = action["type"]
+        slots = action.get("slots", {})
+
+        if t == "disambiguate":
+            choices = ", ".join(slots.get("choices", [])[:5])
+            if response is not None:
+                response.headers["X-Answer-Source"] = "order:item_disambiguate"
+            return ChatResp(reply=f"Did you mean: {choices}? Tell me the exact name.")
+
+        if t == "add_to_cart":
+            try:
+                _ = oc.add_to_cart(AddToCartPayload(
+                    item_id=slots["item_id"],
+                    qty=slots.get("quantity", 1),
+                    modifiers=slots.get("modifiers", []),
+                ))
+                bump_food_orders([{"name": slots["item_id"], "qty": slots.get("quantity", 1)}])  # best-effort popularity bump
+                if response is not None:
+                    response.headers["X-Answer-Source"] = "order:add_to_cart"
+                return ChatResp(reply=f"Added {slots.get('quantity',1)} × {slots['item_id']} to your cart. Say “show cart” or “checkout”.")
+            except Exception as e:
+                log.error("add_to_cart failed: %s", e)
+                return ChatResp(reply="I couldn’t add that right now. Please try again or pick another item.")
+
+        if t == "show_cart":
+            try:
+                cart = oc.get_cart()
+                items = cart.get("items") or []
+                if not items:
+                    if response is not None:
+                        response.headers["X-Answer-Source"] = "order:cart_empty"
+                    return ChatResp(reply="Your cart is empty. Say “add <item name>”.")
+                parts = []
+                for it in items[:5]:
+                    nm = (it.get("name") or it.get("itemId") or 'item').strip()
+                    q = int(it.get("qty") or 1)
+                    parts.append(f"{nm} ×{q}")
+                more = max(0, len(items) - len(parts))
+                suffix = f" (+{more} more)" if more else ""
+                if response is not None:
+                    response.headers["X-Answer-Source"] = "order:show_cart"
+                return ChatResp(reply=f"In your cart: {', '.join(parts)}{suffix}. Say “checkout” to continue.")
+            except Exception as e:
+                log.error("get_cart failed: %s", e)
+                return ChatResp(reply="I couldn’t load your cart. Please try again.")
+
+        if t == "checkout":
+            addr, contact = extract_address_and_contact_from_mem(user_id)
+            method = slots.get("payment_method", "card")
+            try:
+                res = oc.checkout(CheckoutPayload(address=addr, contact=contact, method=method))
+                checkout_url = res.get("checkoutUrl") or res.get("url") or ""
+                client_secret = res.get("clientSecret") or ""
+                if response is not None:
+                    response.headers["X-Answer-Source"] = "order:checkout"
+                    if checkout_url:
+                        response.headers["X-Checkout-Url"] = checkout_url
+                    if client_secret:
+                        response.headers["X-Client-Secret"] = client_secret
+                if checkout_url:
+                    return ChatResp(reply="Secure payment link is ready. Complete payment to place your order.")
+                if client_secret:
+                    return ChatResp(reply="Payment is ready. I’ll help you finalize it in the app.")
+                return ChatResp(reply="Checkout is prepared. Follow the payment steps to finish.")
+            except Exception as e:
+                log.error("checkout failed: %s", e)
+                return ChatResp(reply="I couldn’t start checkout. Please verify your address and try again.")
+
+        if t == "confirm_order":
+            pid = slots.get("payment_intent_id")
+            if not pid:
+                return ChatResp(reply="If you have a Payment Intent ID, paste it and say “confirm payment”.")
+            try:
+                res = oc.confirm(ConfirmPayload(payment_intent_id=pid))
+                order_id = res.get("orderId") or res.get("_id")
+                eta = res.get("eta") or "soon"
+                if response is not None:
+                    response.headers["X-Answer-Source"] = "order:confirm"
+                    if order_id:
+                        response.headers["X-Order-Id"] = str(order_id)
+                return ChatResp(reply=f"Order confirmed 🎉 ETA {eta}. I’ll keep you posted here.")
+            except Exception as e:
+                log.error("confirm failed: %s", e)
+                return ChatResp(reply="I couldn’t confirm that payment. If it succeeded, you’ll see the order in your history shortly.")
 
     # ---- Popularity questions (guarded LLM) ----
     if is_popularity_query(user_msg):
