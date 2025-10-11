@@ -21,18 +21,23 @@ router.use((req, res, next) => {
   if (origin && origin === FRONTEND_URL) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
-  // vary for caches/CDN
   res.setHeader("Vary", "Origin");
 
-  // allow auth and AJAX
   res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  // IMPORTANT: include custom headers used by the frontend
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Requested-With"
+    [
+      "Content-Type",
+      "Authorization",
+      "X-Requested-With",
+      "X-User-JWT",
+      "X-User-Cookie",
+      "x-service-auth",
+    ].join(", ")
   );
 
-  // quick end for preflight
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
@@ -43,7 +48,6 @@ function validateBody(body) {
   const msg = body.message.trim();
   if (!msg) return "message is required";
   if (msg.length > MAX_MESSAGE_LEN) return `message too long (>${MAX_MESSAGE_LEN})`;
-  // Ignore any client-sent userId; we derive it from JWT
   return null;
 }
 
@@ -84,7 +88,6 @@ function getCookieToken(req) {
  * If no valid JWT, allow a DEV-ONLY override via header/query.
  */
 function getUserIdFromRequest(req) {
-  // 1) Real auth path: Authorization or cookie
   try {
     const token = getBearerToken(req) || getCookieToken(req);
     if (token && JWT_KEY) {
@@ -95,7 +98,6 @@ function getUserIdFromRequest(req) {
     // invalid/expired token → fall through to debug overrides
   }
 
-  // 2) Dev override (only when no valid JWT): header or query param
   const debugHeader = req.headers["x-debug-userid"];
   const debugQuery = req.query?.debug_user_id;
   const override =
@@ -108,7 +110,6 @@ function getUserIdFromRequest(req) {
 router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
   const reqId = req.headers["x-request-id"] || randomUUID();
 
-  // Validate input (message only)
   const errMsg = validateBody(req.body);
   if (errMsg) {
     return res.status(400).json({ error: errMsg, requestId: reqId });
@@ -122,12 +123,21 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
   // Build upstream request (only include userId if present)
   const upstreamBody = userId ? { message, userId } : { message };
 
+  // Forward auth headers to Python so it can call /api/cart and /api/order
+  const xUserJwt = req.get("X-User-JWT") || "";           // from browser
+  const xUserCookie = req.get("X-User-Cookie") || req.headers.cookie || ""; // browser cookies if any
+  const authHeader = req.get("Authorization") || "";
+
   const buildInit = () => ({
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-service-auth": SHARED_SECRET, // must match Python SHARED_SECRET
-      "x-request-id": reqId, // pass through for tracing
+      "x-service-auth": SHARED_SECRET, // must match FastAPI SHARED_SECRET
+      "x-request-id": reqId,
+      // pass through auth so FastAPI can see it and attach to OrderClient
+      "X-User-JWT": xUserJwt,
+      "X-User-Cookie": xUserCookie,
+      "Authorization": authHeader,
     },
     body: JSON.stringify(upstreamBody),
   });
@@ -143,7 +153,6 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     attempt++;
     try {
       upstreamRes = await tryOnce();
-      // Retry only on upstream server errors
       if ([502, 503, 504].includes(upstreamRes.status) && attempt < MAX_RETRIES) {
         await new Promise((r) => setTimeout(r, 250 * attempt));
         continue;
@@ -166,42 +175,45 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     return res.status(502).json({ error: "Chat service unavailable", requestId: reqId });
   }
 
-  // Map 5xx to 502 so we don't leak internal upstream codes
   const passthroughStatus = upstreamRes.status >= 500 ? 502 : upstreamRes.status;
 
-  // Capture upstream headers
+  // Capture upstream headers (and bubble useful ones)
   const upstreamAnswerSource = upstreamRes.headers.get("x-answer-source") || undefined;
   const upstreamReqId = upstreamRes.headers.get("x-request-id") || reqId;
   const upstreamEchoUserId = upstreamRes.headers.get("x-echo-userid") || "";
 
-  // Parse JSON safely
+  // Optional: pass through checkout/payment metadata if FastAPI sets them
+  const checkoutUrl = upstreamRes.headers.get("x-checkout-url");
+  const clientSecret = upstreamRes.headers.get("x-client-secret");
+  const orderId = upstreamRes.headers.get("x-order-id");
+  if (checkoutUrl) res.setHeader("X-Checkout-Url", checkoutUrl);
+  if (clientSecret) res.setHeader("X-Client-Secret", clientSecret);
+  if (orderId) res.setHeader("X-Order-Id", orderId);
+
   let data;
   const isJson = upstreamRes.headers.get("content-type")?.includes("application/json");
   try {
-    data = isJson ? await upstreamRes.json() : { error: "Invalid content-type from chatbot service" };
+    data = isJson
+      ? await upstreamRes.json()
+      : { error: "Invalid content-type from chatbot service" };
   } catch {
     data = { error: "Invalid JSON response from chatbot service" };
   }
 
-  // Normalize successful-but-empty replies
   if (passthroughStatus < 400 && (typeof data?.reply !== "string" || data.reply.length === 0)) {
     data = { reply: "" };
   }
 
-  // Surface answer source + echo userId for debugging
   if (data && typeof data === "object") {
     if (upstreamAnswerSource && data.answerSource == null) {
       data.answerSource = upstreamAnswerSource;
     }
     data.echoUserId = upstreamEchoUserId || null; // what FastAPI received
-    data.attachedUserId = userId || null;        // what we attached
+    data.attachedUserId = userId || null;        // what we derived
   }
 
-  // Pass through helpful headers
   if (upstreamAnswerSource) res.setHeader("X-Answer-Source", upstreamAnswerSource);
   if (upstreamEchoUserId)   res.setHeader("X-Echo-UserId", upstreamEchoUserId);
-
-  // Echo tracing id back
   res.setHeader("X-Request-Id", upstreamReqId);
   res.setHeader("Cache-Control", "no-store");
 
@@ -215,6 +227,8 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     answerSource: upstreamAnswerSource ?? null,
     hasUserId: Boolean(userId),
     echoUserId: upstreamEchoUserId || null,
+    fwdJwt: Boolean(xUserJwt),
+    fwdCookie: Boolean(xUserCookie),
   });
 
   return res.status(passthroughStatus).json({ ...data, requestId: upstreamReqId });
