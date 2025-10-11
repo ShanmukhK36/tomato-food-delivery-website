@@ -13,17 +13,19 @@ import 'dotenv/config';
 const app = express();
 const port = process.env.PORT || 4000;
 
-// --- CORS: sanitize origins and include custom headers ---
+/* ----------------------- CORS (global) ----------------------- */
+/* Allow your frontend and custom headers used by the chat proxy */
 const ALLOWED_ORIGINS = [
   'http://localhost:5173',
-  process.env.FRONTEND_URL,
-].filter(Boolean); // drop undefined/empty
+  process.env.FRONTEND_URL, // e.g. https://tomato-food-delivery-website-umber.vercel.app
+].filter(Boolean);
 
 app.use(
   cors({
     origin: (origin, cb) => {
-      // allow no-origin (mobile apps/postman) or listed origins
-      if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      // allow requests without an Origin (curl, server-to-server)
+      if (!origin) return cb(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
       return cb(new Error(`CORS: origin ${origin} not allowed`));
     },
     credentials: true,
@@ -31,38 +33,85 @@ app.use(
     allowedHeaders: [
       'Content-Type',
       'Authorization',
+      'X-Requested-With',
       'X-User-JWT',
       'X-User-Cookie',
       'x-service-auth',
+      'x-request-id',
     ],
   })
 );
-// Optional explicit preflight handler (helps some hosts)
-app.options('*', cors());
 
-// --- Stripe webhook: RAW body BEFORE express.json ---
+// Extra CORS headers & preflight handling (helps on some hosts/CDNs)
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+    // reflect exact origin (required if credentials: true)
+    res.setHeader('Access-Control-Allow-Origin', origin || ALLOWED_ORIGINS[0] || '*');
+  }
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    [
+      'Content-Type',
+      'Authorization',
+      'X-Requested-With',
+      'X-User-JWT',
+      'X-User-Cookie',
+      'x-service-auth',
+      'x-request-id',
+    ].join(', ')
+  );
+  // Let the browser read these headers in JS (handy for debug & checkout flows)
+  res.setHeader(
+    'Access-Control-Expose-Headers',
+    [
+      'X-Answer-Source',
+      'X-Request-Id',
+      'X-Checkout-Url',
+      'X-Client-Secret',
+      'X-Order-Id',
+      'X-Echo-UserId',
+    ].join(', ')
+  );
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
+
+/* -------- Stripe webhook: RAW body BEFORE express.json -------- */
 app.post(
   '/api/order/webhook',
   express.raw({ type: 'application/json' }),
   handleStripeWebhook
 );
 
-// Normal JSON parsing for the rest
+/* ------------------- JSON body for other routes ------------------- */
 app.use(express.json({ limit: '10kb' }));
 
-// --- Infra ---
+/* ---------------------- Infra (DB / Cloud) ---------------------- */
 connectDB();
 connectCloudinary();
 
-// --- Routes ---
+/* --------------------------- Routes ---------------------------- */
 app.use('/api/food', foodRouter);
 app.use('/api/user', userRouter);
 app.use('/api/cart', cartRouter);
 app.use('/api/order', orderRouter);
-app.use('/api/chat', chatRouter); // this must forward to Python
+app.use('/api/chat', chatRouter); // proxies to FastAPI and forwards auth headers
 
-// --- Health ---
+/* --------------------------- Health ---------------------------- */
 app.get('/', (_req, res) => res.send('API working'));
+
+/* ----------------------- Error handling ------------------------ */
+// Optional: normalize CORS errors to 403 instead of 500
+app.use((err, _req, res, next) => {
+  if (err?.message?.startsWith('CORS:')) {
+    return res.status(403).json({ error: err.message });
+  }
+  next(err);
+});
 
 app.listen(port, () => {
   console.log(`Server started on http://localhost:${port}`);
