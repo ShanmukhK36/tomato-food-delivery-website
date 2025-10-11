@@ -928,19 +928,28 @@ class OrderClient:
         raise RuntimeError(f"GET failed for {candidates}: {last_err}")
 
     # ---- CART ----
-    def add_to_cart(self, payload: AddToCartPayload):
+    def add_to_cart(self, payload: AddToCartPayload, user_id: Optional[str] = None):
         body = {"itemId": payload.item_id, "qty": payload.qty, "modifiers": payload.modifiers or []}
+        if user_id:  # fallback for dev/staging APIs that accept userId
+            body["userId"] = user_id
         return self._post_try(
             candidates=["/cart/items", "/cart/add", "/cart"],
             json=body,
             timeout=6.0,
         )
 
-    def get_cart(self):
-        return self._get_try(
-            candidates=["/cart", "/cart/items"],
-            timeout=6.0,
-        )
+    def get_cart(self, user_id: Optional[str] = None):
+        if user_id:
+            # try with userId in query, then without
+            return self._get_try(
+                candidates=[f"/cart?userId={user_id}", f"/cart/items?userId={user_id}", "/cart", "/cart/items"],
+                timeout=6.0,
+            )
+        else:
+            return self._get_try(
+                candidates=["/cart", "/cart/items"],
+                timeout=6.0,
+            )
 
     # ---- ORDER / CHECKOUT ----
     def checkout(self, payload: CheckoutPayload):
@@ -964,7 +973,16 @@ class OrderClient:
 
 # === ORDERING intent extraction (multi-item support) ===
 # Patterns
-SHOW_CART_PATTERNS = (r"\b(show|view|see)\b.*\b(cart|basket)\b", r"\bwhat'?s in my cart\b")
+SHOW_CART_PATTERNS = (
+    r"\b(show|view|see)\b.*\b(cart|basket|bag)\b",
+    r"\bwhat'?s in (my )?cart\b",
+    r"\bshowcart\b",
+    r"\bviewcart\b",
+    r"\bmy\s*cart\b",
+    r"\bcart\b",
+    r"\bbasket\b",
+    r"\bbag\b",
+)
 CHECKOUT_PATTERNS = (r"\b(check ?out|pay|proceed to payment|place (the )?order)\b",)
 CONFIRM_PATTERNS = (r"\b(confirm|finalize)\b.*\b(payment|order)\b",)
 ADD_PATTERNS = (r"\b(add|order|get|i'?ll have|i want)\b",)
@@ -1035,8 +1053,9 @@ def extract_action(user_msg: str) -> Optional[dict]:
     t = (user_msg or "").strip()
     low = t.lower()
 
-    if any(re.search(p, low) for p in SHOW_CART_PATTERNS):
-        return {"type": "show_cart", "slots": {}}
+    for p in SHOW_CART_PATTERNS:
+        if re.search(p, low, flags=re.IGNORECASE):
+            return {"type": "show_cart", "slots": {}}
 
     if any(re.search(p, low) for p in CHECKOUT_PATTERNS):
         return {"type": "checkout", "slots": {"payment_method": extract_payment_method(low)}}
@@ -1227,15 +1246,16 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
     # === ORDERING (cart, checkout, confirm) ===
     action = extract_action(user_msg)
     if action and ORDER_API_BASE:
-        if REQUIRE_AUTH_FOR_ORDER and (not user_id or user_id == "guest"):
-            txt = "Please log in to add items or checkout. Once signed in, say “Rice Zucchini x 1, Clover Salad x 2”."
-            if response is not None:
-                response.headers["X-Answer-Source"] = "order:login_required"
-            return ChatResp(reply=txt)
-
-        # forward user auth
+        # If orders require auth AND we don't have any auth to forward, tell the user explicitly.
         fwd_jwt = request.headers.get(USER_JWT_HEADER, "") if request else ""
         fwd_cookie = request.headers.get(USER_COOKIE_HEADER, "") if request else ""
+        if REQUIRE_AUTH_FOR_ORDER and not (fwd_jwt or fwd_cookie):
+            # We cannot prove the user is logged in from the chatbot’s POV.
+            txt = ("Please log in to your account, then try again from the same browser/app. "
+                f"Your frontend should forward auth via headers **{USER_JWT_HEADER}** or **{USER_COOKIE_HEADER}**.")
+            if response is not None:
+                response.headers["X-Answer-Source"] = "order:auth_missing"
+            return ChatResp(reply=txt)
 
         try:
             oc = OrderClient(ORDER_API_BASE, jwt=fwd_jwt, cookie=fwd_cookie)
@@ -1256,7 +1276,9 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             failed = []
             for it in slots.get("items", []):
                 try:
-                    _ = oc.add_to_cart(AddToCartPayload(item_id=it["item_id"], qty=it["qty"], modifiers=[]))
+                    item_id = it.get("item_id") or it.get("name")
+                    qty = int(it.get("qty", 1)) or 1
+                    _ = oc.add_to_cart(AddToCartPayload(item_id=item_id, qty=qty, modifiers=[]), user_id=user_id)
                     bump_food_orders([{"name": it["item_id"], "qty": it["qty"]}])
                     added.append(f'{it["item_id"]} ×{it["qty"]}')
                 except Exception:
@@ -1277,7 +1299,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
 
         if t == "show_cart":
             try:
-                cart = oc.get_cart()
+                cart = oc.get_cart(user_id=user_id)
                 items = cart.get("items") or []
                 if not items:
                     if response is not None:
@@ -1294,7 +1316,9 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                     response.headers["X-Answer-Source"] = "order:show_cart"
                 return ChatResp(reply=f"In your cart: {', '.join(parts)}{suffix}. Say “checkout” to continue.")
             except Exception as e:
-                log.error("get_cart failed: %s", e)
+                log.error("get_cart failed for user_id=%s: %s", user_id, e)
+                if REQUIRE_AUTH_FOR_ORDER:
+                    return ChatResp(reply="I couldn’t load your cart. Please make sure you’re signed in and the app forwards your login to chat.")
                 return ChatResp(reply="I couldn’t load your cart. Please try again.")
 
         if t == "checkout":

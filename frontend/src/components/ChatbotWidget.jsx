@@ -5,18 +5,23 @@ const uid = () => Math.random().toString(36).slice(2, 10);
 const getUserId = () => localStorage.getItem("userId") || "guest";
 const getToken = () => localStorage.getItem("token") || "";
 const keyFor = (userId) => `tomatoai:${userId}:messages`;
+const getCookieString = () => {
+  try {
+    return document?.cookie || "";
+  } catch {
+    return "";
+  }
+};
 
 const ChatbotWidget = () => {
-  const { url } = useContext(StoreContext);
+  const { url } = useContext(StoreContext); // Your Node base URL that proxies to Python at /api/chat
 
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
 
-  // live user id that reacts to login/logout
   const [userId, setUserId] = useState(getUserId());
 
-  // message thread per user
   const [messages, setMessages] = useState(() => {
     const u = getUserId();
     const cached = localStorage.getItem(keyFor(u));
@@ -48,7 +53,7 @@ const ChatbotWidget = () => {
     };
     window.addEventListener("storage", onStorage);
     window.addEventListener("focus", sync);
-    const timer = setInterval(sync, 1000); // safety net for same-tab updates
+    const timer = setInterval(sync, 1000);
     return () => {
       window.removeEventListener("storage", onStorage);
       window.removeEventListener("focus", sync);
@@ -94,12 +99,10 @@ const ChatbotWidget = () => {
     const text = input.trim();
     if (!text || loading) return;
 
-    // always read the freshest ids right before sending
     const currentUserId = getUserId();
     const token = getToken();
     if (currentUserId !== userId) setUserId(currentUserId);
 
-    // cancel any in-flight request
     controllerRef.current?.abort?.();
     const ac = new AbortController();
     controllerRef.current = ac;
@@ -111,23 +114,22 @@ const ChatbotWidget = () => {
 
     const tryFetch = async (attempt = 1) => {
       try {
-        // Build headers: JWT if available; otherwise dev override header
-        const headers = { "Content-Type": "application/json" };
-        if (token) {
-          headers.Authorization = `Bearer ${token}`;
-        } else if (currentUserId && currentUserId !== "guest") {
-          headers["X-Debug-UserId"] = currentUserId;
-        }
+        // Forward auth so Python can reach /api/cart, /api/order, etc.
+        const headers = {
+          "Content-Type": "application/json",
+          "X-User-JWT": token || "",
+          "X-User-Cookie": getCookieString(),
+        };
+        if (token) headers.Authorization = `Bearer ${token}`;
 
-        const res = await fetch(url + "/api/chat", {
+        const res = await fetch(`${url}/api/chat`, {
           method: "POST",
           headers,
-          // IMPORTANT: don't send userId in body — backend derives it from JWT
-          body: JSON.stringify({ message: text }),
+          credentials: "include", // include cookies when same-origin
+          body: JSON.stringify({ message: text, userId: currentUserId }),
           signal: ac.signal,
         });
 
-        // Parse JSON safely even on errors
         let data = {};
         try {
           data = await res.json();
@@ -136,17 +138,27 @@ const ChatbotWidget = () => {
         }
 
         if (!res.ok) {
-          const rid = data?.requestId ? ` · id=${data.requestId}` : "";
-          throw new Error((data?.error || `HTTP ${res.status}`) + rid);
+          const rid =
+            (data && data.requestId && ` · id=${data.requestId}`) ||
+            (res.headers.get("x-request-id") &&
+              ` · id=${res.headers.get("x-request-id")}`) ||
+            "";
+          throw new Error((data.detail || data.error || `HTTP ${res.status}`) + rid);
         }
+
+        const reply =
+          typeof data.reply === "string" ? data.reply : "…";
 
         const botMsg = {
           id: uid(),
           role: "assistant",
-          content: typeof data.reply === "string" ? data.reply : "...",
+          content: reply,
           ts: Date.now(),
         };
         setMessages((m) => [...m, botMsg]);
+
+        // If you later bubble up checkoutUrl/clientSecret from Python,
+        // you can read them here: data.checkoutUrl / data.clientSecret
       } catch (err) {
         if (ac.signal.aborted) return;
         if (attempt < 2) {
@@ -159,7 +171,7 @@ const ChatbotWidget = () => {
           {
             id: uid(),
             role: "assistant",
-            content: `Sorry — ${String(err.message || "request failed")}.`,
+            content: `Sorry — ${String(err?.message || "request failed")}.`,
             ts: Date.now(),
             error: true,
             retryPayload: { text },
