@@ -209,9 +209,7 @@ def explain_stripe_error(text: str) -> str:
         st = found_statuses[0]; lines.append(f"Status **{st}** — {STRIPE_ERRORS['intents'][st]}")
 
     if not lines:
-        lines = [
-            "I can help with Stripe errors. If you paste the JSON (type / code / decline_code), I’ll decode it.",
-        ]
+        lines = ["I can help with Stripe errors. If you paste the JSON (type / code / decline_code), I’ll decode it."]
     lines.append("Next steps: confirm the exact error fields, retry only idempotently, or collect a new payment method / contact bank if it’s a decline.")
     reply = " ".join(lines)
     return (reply[:900].rstrip() + "…") if len(reply) > 900 else reply
@@ -222,37 +220,30 @@ STATIC_FOODS = [
     {"name": "Veg salad", "category": "salad", "price": 18, "description": "Crisp garden salad; not spicy. Ingredients: mixed greens, cucumber, tomato, carrots, sweet corn, bell peppers, light lemon-herb vinaigrette."},
     {"name": "Clover Salad", "category": "salad", "price": 16, "description": "Wholesome green bowl; not spicy. Ingredients: lettuce, chickpeas, cucumber, cherry tomatoes, fresh herbs, avocado, lemon-tahini dressing."},
     {"name": "Chicken Salad", "category": "salad", "price": 24, "description": "Protein-packed salad; not spicy. Ingredients: grilled chicken, lettuce, celery, cherry tomatoes, cucumber, yogurt-mayo dressing, parsley."},
-
     {"name": "Lasagna Rolls", "category": "rolls", "price": 14, "description": "Baked pasta roll-ups; not spicy. Ingredients: lasagna sheets, ricotta, spinach, mozzarella, marinara sauce, parmesan."},
     {"name": "Peri Peri Rolls", "category": "rolls", "price": 12, "description": "Fiery wrap; spicy. Ingredients: peri-peri marinated chicken, onions, lettuce, pickles, creamy chili mayo, soft roll/flatbread."},
     {"name": "Chicken Rolls", "category": "rolls", "price": 20, "description": "Street-style kathi roll; medium spicy. Ingredients: spiced chicken, sautéed onions, capsicum, lime, coriander, egg-paratha or tortilla."},
     {"name": "Veg Rolls", "category": "rolls", "price": 15, "description": "Hearty veggie wrap; mild. Ingredients: paneer/potato & mixed veg, onions, capsicum, mint-yogurt or chutney, wrapped in paratha/tortilla."},
-
     {"name": "Ripple Ice Cream", "category": "desserts", "price": 14, "description": "Creamy ice cream streaked with sauce; sweet. Ingredients: dairy base, fudge/caramel ‘ripple’, vanilla."},
     {"name": "Fruit Ice Cream", "category": "desserts", "price": 22, "description": "Real fruit in every scoop; sweet. Ingredients: dairy base, seasonal fruit purée (e.g., strawberry/mango), fruit chunks."},
     {"name": "Jar Ice Cream", "category": "desserts", "price": 10, "description": "Layered jar dessert; sweet. Ingredients: ice cream, crushed cookies/cake, sauce (chocolate/caramel), whipped cream."},
     {"name": "Vanilla Ice Cream", "category": "desserts", "price": 12, "description": "Classic vanilla; sweet. Ingredients: dairy base, Madagascar/Bourbon vanilla."},
-
     {"name": "Chicken Sandwich", "category": "sandwich", "price": 12, "description": "Comfort sandwich; not spicy. Ingredients: grilled or crispy chicken, lettuce, tomato, pickles, mayo in toasted bread/bun."},
     {"name": "Vegan Sandwich", "category": "sandwich", "price": 18, "description": "Plant-based; mild. Ingredients: hummus or avocado, grilled vegetables, cucumber, tomato, greens, olive oil on whole-grain bread."},
     {"name": "Grilled Sandwich", "category": "sandwich", "price": 16, "description": "Golden & melty; not spicy. Ingredients: butter-toasted bread, cheese, tomato, onion, herbs."},
     {"name": "Bread Sandwich", "category": "sandwich", "price": 24, "description": "Simple veggie sandwich; mild. Ingredients: soft bread, cucumber, tomato, lettuce, cheese (optional), butter/mayo."},
-
     {"name": "Cup Cake", "category": "cake", "price": 14, "description": "Single-serve frosted cake; sweet. Ingredients: flour, butter, sugar, eggs, vanilla/cocoa, buttercream frosting."},
     {"name": "Vegan Cake", "category": "cake", "price": 12, "description": "Egg- & dairy-free; sweet. Ingredients: flour, cocoa/vanilla, plant milk, vegetable oil, sugar, vegan frosting."},
     {"name": "Butterscotch Cake", "category": "cake", "price": 20, "description": "Rich caramel notes; sweet. Ingredients: vanilla sponge, butterscotch sauce, praline/toffee bits, whipped cream."},
     {"name": "Sliced Cake", "category": "cake", "price": 15, "description": "Classic tea-time slice; sweet. Ingredients: butter pound cake/vanilla sponge, light glaze (optional)."},
-
     {"name": "Garlic Mushroom", "category": "veg", "price": 14, "description": "Savory sauté; not spicy. Ingredients: button mushrooms, garlic, butter/olive oil, parsley, black pepper."},
     {"name": "Fried Cauliflower", "category": "veg", "price": 22, "description": "Crispy florets; mild. Ingredients: cauliflower, seasoned batter, oil for frying, optional garlic/pepper sprinkle."},
     {"name": "Mix Veg Pulao", "category": "veg", "price": 10, "description": "Fragrant rice; mildly spiced. Ingredients: basmati rice, peas, carrots, beans, onions, whole spices (cumin, bay, clove), ghee/oil."},
     {"name": "Rice Zucchini", "category": "veg", "price": 12, "description": "Light herby rice; not spicy. Ingredients: rice, sautéed zucchini, garlic, olive oil, parsley, lemon zest."},
-
     {"name": "Cheese Pasta", "category": "pasta", "price": 12, "description": "Comfort cheesy pasta; not spicy. Ingredients: pasta, cheddar/mozzarella, milk/cream, butter, garlic."},
     {"name": "Tomato Pasta", "category": "pasta", "price": 18, "description": "Bright marinara; mild. Ingredients: pasta, tomato sauce, garlic, olive oil, basil, parmesan."},
     {"name": "Creamy Pasta", "category": "pasta", "price": 16, "description": "Silky white-sauce pasta; not spicy. Ingredients: pasta, cream or béchamel, garlic, parmesan, black pepper."},
     {"name": "Chicken Pasta", "category": "pasta", "price": 24, "description": "Hearty & satisfying; mild. Ingredients: pasta, grilled chicken, tomato or cream sauce, garlic, herbs, parmesan."},
-
     {"name": "Butter Noodles", "category": "noodles", "price": 14, "description": "Simple & comforting; not spicy. Ingredients: noodles, butter, garlic (optional), herbs, salt & pepper."},
     {"name": "Veg Noodles", "category": "noodles", "price": 12, "description": "Stir-fried chow mein; mild to medium. Ingredients: wheat noodles, cabbage, carrot, bell pepper, spring onion, soy-garlic sauce."},
     {"name": "Somen Noodles", "category": "noodles", "price": 20, "description": "Japanese thin noodles; not spicy. Ingredients: chilled somen, light soy-dashi dipping sauce, scallions, sesame."},
@@ -260,7 +251,6 @@ STATIC_FOODS = [
 ]
 
 def bootstrap_foods_if_empty():
-    """Upsert a small menu so DB answers work immediately (now with descriptions)."""
     if db is None:
         return
     try:
@@ -298,7 +288,6 @@ def take(iterable, n):
     return list(islice(iterable, n))
 
 def to_safe_dt(v):
-    """Parse Mongo Date or ISO string to aware datetime; else None."""
     if isinstance(v, datetime):
         dt = v
     elif isinstance(v, str):
@@ -366,7 +355,6 @@ def list_all_food_names(limit=200) -> List[str]:
         return []
 
 def find_item_candidates_by_name(query: str, limit: int = 5):
-    """Find likely item matches via exact, regex, and fuzzy ranking."""
     if db is None:
         return []
     q = _norm(query)
@@ -403,12 +391,10 @@ def find_item_candidates_by_name(query: str, limit: int = 5):
         return []
 
 def format_item_detail(item: dict) -> str:
-    """Single-line, policy-compliant item detail."""
     name = item.get("name", "Item")
     price = item.get("price")
     cat = (item.get("category") or "").rstrip("s")
     desc = (item.get("description") or "").strip()
-    # price format
     try:
         price_str = f"${int(float(price))}" if float(price).is_integer() else f"${float(price)}"
     except Exception:
@@ -473,7 +459,6 @@ def get_user_recent_orders(user_id: Optional[str], limit=MAX_RECENT) -> List[str
         log.exception("get_user_recent_orders failed")
         return []
 
-# --- Pretty recent-order formatting helpers ---
 def _short_id(oid):
     s = str(oid or "")
     return ("…" + s[-2:]) if len(s) > 2 else s
@@ -497,11 +482,6 @@ def _summarize_items(items, max_items=3):
     return total_qty, preview
 
 def get_user_recent_orders_detailed(user_id: Optional[str], limit=MAX_RECENT):
-    """
-    Fetch recent orders with normalized datetime `dt` chosen from:
-    date | order_date | created_at. Sorted by dt desc.
-    Returns: [{order_id, dt, items:[{name,qty},...], amount, status}, ...]
-    """
     if db is None or not user_id or user_id == "guest":
         return []
     try:
@@ -561,11 +541,9 @@ def is_payment_status_query(text: str) -> bool:
     return any(k in t for k in _PAYMENT_STATUS_KEYWORDS)
 
 def _pick_dt(d):
-    """Pick best datetime field from an order doc."""
     return d.get("date") or d.get("order_date") or d.get("created_at")
 
 def get_user_last_order_with_payment(user_id: Optional[str]) -> Optional[dict]:
-    """Returns the most recent order for the user with payment fields."""
     if db is None or not user_id or user_id == "guest":
         return None
     try:
@@ -574,8 +552,7 @@ def get_user_last_order_with_payment(user_id: Optional[str]) -> Optional[dict]:
             return None
         pipeline = [
             {"$match": flt},
-            {"$addFields": {"_dt": {"$ifNull": ["$date", {"$ifNull": ["$order_date", "$created_at"]}]}}}
-            ,
+            {"$addFields": {"_dt": {"$ifNull": ["$date", {"$ifNull": ["$order_date", "$created_at"]}]}}},
             {"$sort": {"_dt": -1, "_id": -1}},
             {"$limit": 1},
             {"$project": {
@@ -598,11 +575,6 @@ def get_user_last_order_with_payment(user_id: Optional[str]) -> Optional[dict]:
         return None
 
 def explain_last_order_payment(order: dict) -> str:
-    """
-    Summarize last order payment result.
-    - If success → short success message with amount & time.
-    - If failed → decode Stripe error using explain_stripe_error().
-    """
     if not order:
         return "I couldn’t find a previous transaction for your account yet."
 
@@ -621,7 +593,6 @@ def explain_last_order_payment(order: dict) -> str:
     sess_id = (stripe.get("sessionId") or "").strip()
     intent_id = (stripe.get("paymentIntentId") or "").strip()
 
-    # Heuristic for success
     is_success = (
         paid_flag
         or status in ("PAID", "COMPLETED", "FULFILLED")
@@ -645,23 +616,16 @@ def explain_last_order_payment(order: dict) -> str:
             parts.append("(" + ", ".join(tail_bits) + ")")
         return " ".join(parts)
 
-    # Failure: try to decode via our existing Stripe knowledge
     probe = []
-    if err_code:
-        probe.append(f"code: {err_code}")
-    if err_msg:
-        probe.append(err_msg)
-    if stripe_status:
-        probe.append(f"status: {stripe_status}")
-
-    # Fall back to top-level status if nothing else
+    if err_code: probe.append(f"code: {err_code}")
+    if err_msg:  probe.append(err_msg)
+    if stripe_status: probe.append(f"status: {stripe_status}")
     if not probe and status:
         probe.append(f"status: {status.lower()}")
 
     if not probe:
         return ("It looks like the last payment did not succeed. "
                 "Please try another card or contact your bank, and you can try again.")
-
     return explain_stripe_error(" | ".join(probe))
 
 # Category helpers
@@ -719,8 +683,7 @@ def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> Lis
                             {"$match": {"$expr": {"$and": [
                                 {"$eq": [{"$toLower": "$name"}, {"$toLower": "$$itemName"}]},
                                 {"$eq": [{"$toLower": "$category"}, cat_lower]},
-                            ]}}},
-                            {"$project": {"_id": 0, "name": 1}},
+                            ]}}}
                         ],
                         "as": "food"
                     }
@@ -769,7 +732,7 @@ def bump_food_orders(items: List[dict]):
         return
     try:
         for it in items or []:
-            name = (it.get("name") or "").strip()
+            name = (it.get("name") or it.get("item_id") or "").strip()
             qty = int(it.get("qty") or 1)
             if not name:
                 continue
@@ -848,7 +811,6 @@ def build_context(user_msg: str, user_id: Optional[str]) -> str:
     return ("Database context:\n" + "\n".join(ctx_parts) + "\n") if ctx_parts else ""
 
 def guarded_rewrite(user_msg: str, draft: str) -> str:
-    """Guardrails so the LLM never goes off-menu."""
     menu = ", ".join(list_all_food_names())
     rules = (
         "Rules:\n"
@@ -896,14 +858,14 @@ class OrderClient:
         self.s.headers.update({"Accept": "application/json"})
 
         if jwt:
-            # keep both so either style works downstream
-            self.s.headers[USER_JWT_HEADER] = jwt           
+            # keep both styles so downstream accepts either
+            self.s.headers[USER_JWT_HEADER] = jwt
             self.s.headers["Authorization"] = f"Bearer {jwt}"
 
         if cookie:
-            self.s.headers["Cookie"] = cookie               # ← REQUIRED
-            # keep the debug/trace header too (optional)
-            self.s.headers[USER_COOKIE_HEADER] = cookie     
+            # forward real cookie + custom header copy
+            self.s.headers["Cookie"] = cookie
+            self.s.headers[USER_COOKIE_HEADER] = cookie
 
     def _url(self, p: str) -> str:
         return f"{self.base}{p}"
@@ -935,8 +897,8 @@ class OrderClient:
     # ---- CART ----
     def add_to_cart(self, payload: AddToCartPayload, user_id: Optional[str] = None):
         body = {"itemId": payload.item_id, "qty": payload.qty, "modifiers": payload.modifiers or []}
-        if user_id:  # fallback for dev/staging APIs that accept userId
-            body["userId"] = user_id
+        if user_id:
+            body["userId"] = user_id  # some APIs accept this for server-side cart scoping
         return self._post_try(
             candidates=["/cart/items", "/cart/add", "/cart"],
             json=body,
@@ -945,16 +907,14 @@ class OrderClient:
 
     def get_cart(self, user_id: Optional[str] = None):
         if user_id:
-            # try with userId in query, then without
             return self._get_try(
                 candidates=[f"/cart?userId={user_id}", f"/cart/items?userId={user_id}", "/cart", "/cart/items"],
                 timeout=6.0,
             )
-        else:
-            return self._get_try(
-                candidates=["/cart", "/cart/items"],
-                timeout=6.0,
-            )
+        return self._get_try(
+            candidates=["/cart", "/cart/items"],
+            timeout=6.0,
+        )
 
     # ---- ORDER / CHECKOUT ----
     def checkout(self, payload: CheckoutPayload):
@@ -977,7 +937,6 @@ class OrderClient:
         )
 
 # === ORDERING intent extraction (multi-item support) ===
-# Patterns
 SHOW_CART_PATTERNS = (
     r"\b(show|view|see)\b.*\b(cart|basket|bag)\b",
     r"\bwhat'?s in (my )?cart\b",
@@ -992,7 +951,6 @@ CHECKOUT_PATTERNS = (r"\b(check ?out|pay|proceed to payment|place (the )?order)\
 CONFIRM_PATTERNS = (r"\b(confirm|finalize)\b.*\b(payment|order)\b",)
 ADD_PATTERNS = (r"\b(add|order|get|i'?ll have|i want)\b",)
 
-# Multi-item parser
 ITEM_QTY_PATTERN = re.compile(
     r"""
     (?P<name>[A-Za-z][A-Za-z\s\-]+?)       # item name
@@ -1054,7 +1012,6 @@ def extract_address_and_contact_from_mem(user_id: Optional[str]):
     return addr, contact
 
 def extract_action(user_msg: str) -> Optional[dict]:
-    """Return {"type": ..., "slots": {...}} or None. Supports multi-item 'order'."""
     t = (user_msg or "").strip()
     low = t.lower()
 
@@ -1078,7 +1035,6 @@ def extract_action(user_msg: str) -> Optional[dict]:
             if mapped:
                 return {"type": "add_multiple", "slots": {"items": mapped}}
             return {"type": "disambiguate", "slots": {"choices": []}}
-        # No explicit items
         return {"type": "prompt_for_items", "slots": {}}
 
     return None
@@ -1092,7 +1048,7 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.8.0-ordering")
+app = FastAPI(title="Tomato Chatbot API", version="1.9.0-ordering")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1171,7 +1127,7 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.8.0-ordering",
+        "version": "1.9.0-ordering",
         "force_llm": FORCE_LLM,
     }
 
@@ -1193,8 +1149,6 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
         raise HTTPException(status_code=400, detail="message is required")
 
     user_id = req.userId or None
-    req_id = getattr(request.state, "req_id", "n/a")
-
     if response is not None:
         response.headers["X-Echo-UserId"] = str(user_id or "")
 
@@ -1220,7 +1174,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             response.headers["X-Answer-Source"] = "rule:stripe"
         return ChatResp(reply=reply)
 
-    # ---- Previous orders (DETAILED with normalized date) ----
+    # ---- Previous orders ----
     if is_previous_orders_query(user_msg):
         if not user_id or user_id == "guest":
             text = "To show your past orders, please log in. Once you’re signed in, ask “show my recent orders.”"
@@ -1251,19 +1205,34 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
     # === ORDERING (cart, checkout, confirm) ===
     action = extract_action(user_msg)
     if action and ORDER_API_BASE:
-        # If orders require auth AND we don't have any auth to forward, tell the user explicitly.
-        fwd_jwt = request.headers.get(USER_JWT_HEADER, "") if request else ""
-        fwd_cookie = request.headers.get(USER_COOKIE_HEADER, "") if request else ""
-        if REQUIRE_AUTH_FOR_ORDER and not (fwd_jwt or fwd_cookie):
-            # We cannot prove the user is logged in from the chatbot’s POV.
+        # --- NEW: collect auth from either custom headers or standard Authorization ---
+        jwt_token = ""
+        fwd_cookie = ""
+        if request:
+            jwt_token = request.headers.get(USER_JWT_HEADER, "") or ""
+            auth_hdr = request.headers.get("authorization", "") or request.headers.get("Authorization", "") or ""
+            if not jwt_token and auth_hdr:
+                jwt_token = auth_hdr
+            if jwt_token.lower().startswith("bearer "):
+                jwt_token = jwt_token[7:].strip()
+            fwd_cookie = request.headers.get(USER_COOKIE_HEADER, "") or ""
+
+        if REQUIRE_AUTH_FOR_ORDER and not (jwt_token or fwd_cookie):
             txt = ("Please log in to your account, then try again from the same browser/app. "
-                f"Your frontend should forward auth via headers **{USER_JWT_HEADER}** or **{USER_COOKIE_HEADER}**.")
+                   f"Your frontend should forward auth via {USER_JWT_HEADER} or {USER_COOKIE_HEADER}, "
+                   "or a standard Authorization: Bearer <token> header.")
             if response is not None:
                 response.headers["X-Answer-Source"] = "order:auth_missing"
+                response.headers["X-Debug-Auth-HasJWT"] = "0"
+                response.headers["X-Debug-Auth-HasCookie"] = "0"
             return ChatResp(reply=txt)
 
+        if response is not None:
+            response.headers["X-Debug-Auth-HasJWT"] = "1" if jwt_token else "0"
+            response.headers["X-Debug-Auth-HasCookie"] = "1" if (fwd_cookie or "").strip() else "0"
+
         try:
-            oc = OrderClient(ORDER_API_BASE, jwt=fwd_jwt, cookie=fwd_cookie)
+            oc = OrderClient(ORDER_API_BASE, jwt=jwt_token, cookie=fwd_cookie)
         except Exception as e:
             log.error("OrderClient init failed: %s", e)
             return ChatResp(reply="Ordering is temporarily unavailable. Please try again shortly.")
@@ -1277,17 +1246,16 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             return ChatResp(reply='Tell me what to add like: “Rice Zucchini x 1, Clover Salad x 2”.')
 
         if t == "add_multiple":
-            added = []
-            failed = []
+            added, failed = [], []
             for it in slots.get("items", []):
                 try:
                     item_id = it.get("item_id") or it.get("name")
                     qty = int(it.get("qty", 1)) or 1
                     _ = oc.add_to_cart(AddToCartPayload(item_id=item_id, qty=qty, modifiers=[]), user_id=user_id)
-                    bump_food_orders([{"name": it["item_id"], "qty": it["qty"]}])
-                    added.append(f'{it["item_id"]} ×{it["qty"]}')
+                    bump_food_orders([{"item_id": item_id, "qty": qty}])
+                    added.append(f'{item_id} ×{qty}')
                 except Exception:
-                    failed.append(it["item_id"])
+                    failed.append(it.get("item_id") or it.get("name") or "item")
             if response is not None:
                 response.headers["X-Answer-Source"] = "order:add_multi"
             if added and not failed:
@@ -1420,7 +1388,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                     response.headers["X-Answer-Source"] = "rule+llm:category" if FORCE_LLM else "rule:category"
                 return ChatResp(reply=final)
 
-    # ---- Build LLM context & generic fallback (still guarded) ----
+    # ---- Generic fallback ----
     db_context = build_context(user_msg, user_id)
     draft = "How can I help with our menu, your order, or delivery?"
     content = f"{db_context}\nCustomer: {user_msg}\nDraft: {draft}\nFollow the rules above."
