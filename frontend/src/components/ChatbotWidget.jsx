@@ -5,17 +5,9 @@ const uid = () => Math.random().toString(36).slice(2, 10);
 const getUserId = () => localStorage.getItem("userId") || "guest";
 const getToken = () => localStorage.getItem("token") || "";
 const keyFor = (userId) => `tomatoai:${userId}:messages`;
-const getCookieString = () => {
-  try {
-    return document?.cookie || "";
-  } catch {
-    return "";
-  }
-};
 
 const ChatbotWidget = () => {
-  const { url } = useContext(StoreContext); // Your Node base URL that proxies to Python at /api/chat
-
+  const { url } = useContext(StoreContext);
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -32,7 +24,7 @@ const ChatbotWidget = () => {
             id: uid(),
             role: "assistant",
             content:
-              "Hi! I’m TomatoAI. Ask me about restaurants, dishes, delivery status, or your orders.",
+              "Hi! I’m TomatoAI. Ask me about dishes, your cart, checkout, or delivery.",
             ts: Date.now(),
           },
         ];
@@ -42,7 +34,7 @@ const ChatbotWidget = () => {
   const inputRef = useRef(null);
   const endRef = useRef(null);
 
-  // keep userId synced with localStorage (login/logout)
+  // Keep userId synced with localStorage (login/logout in another tab)
   useEffect(() => {
     const sync = () => {
       const current = getUserId();
@@ -61,7 +53,7 @@ const ChatbotWidget = () => {
     };
   }, []);
 
-  // when userId changes, load that user's cached thread (or greeting)
+  // When userId changes, load that user's cached thread
   useEffect(() => {
     const cached = localStorage.getItem(keyFor(userId));
     setMessages(
@@ -72,24 +64,24 @@ const ChatbotWidget = () => {
               id: uid(),
               role: "assistant",
               content:
-                "Hi! I’m TomatoAI. Ask me about restaurants, dishes, delivery status, or your orders.",
+                "Hi! I’m TomatoAI. Ask me about dishes, your cart, checkout, or delivery.",
               ts: Date.now(),
             },
           ]
     );
   }, [userId]);
 
-  // persist messages per-user
+  // Persist messages per-user
   useEffect(() => {
     localStorage.setItem(keyFor(userId), JSON.stringify(messages));
   }, [messages, userId]);
 
-  // autoscroll
+  // Autoscroll
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, open]);
 
-  // focus input on open
+  // Focus input on open
   useEffect(() => {
     if (open) setTimeout(() => inputRef.current?.focus(), 0);
   }, [open]);
@@ -103,6 +95,7 @@ const ChatbotWidget = () => {
     const token = getToken();
     if (currentUserId !== userId) setUserId(currentUserId);
 
+    // Cancel any in-flight request
     controllerRef.current?.abort?.();
     const ac = new AbortController();
     controllerRef.current = ac;
@@ -114,19 +107,30 @@ const ChatbotWidget = () => {
 
     const tryFetch = async (attempt = 1) => {
       try {
-        // Forward auth so Python can reach /api/cart, /api/order, etc.
-        const headers = {
-          "Content-Type": "application/json",
-          "X-User-JWT": token || "",
-          "X-User-Cookie": getCookieString(),
-        };
-        if (token) headers.Authorization = `Bearer ${token}`;
+        if (!url) {
+          throw new Error("API base URL missing from StoreContext.url");
+        }
+
+        // Build headers: send JWT if you have it; cookies go via credentials: 'include'
+        const headers = { "Content-Type": "application/json" };
+        if (token) {
+          headers.Authorization = `Bearer ${token}`;
+          headers["X-User-JWT"] = token; // lets Node forward explicitly as well
+        }
+
+        // Client-side debug (one-line, remove if noisy)
+        console.log(
+          "[ChatbotWidget] POST",
+          `${url}/api/chat`,
+          { hasJWT: Boolean(token), userId: currentUserId }
+        );
 
         const res = await fetch(`${url}/api/chat`, {
           method: "POST",
+          credentials: "include", // 🔴 ensures browser sends your login cookies
           headers,
-          credentials: "include", // include cookies when same-origin
-          body: JSON.stringify({ message: text, userId: currentUserId }),
+          // Do NOT send userId in body — backend derives from JWT/cookie
+          body: JSON.stringify({ message: text }),
           signal: ac.signal,
         });
 
@@ -139,11 +143,11 @@ const ChatbotWidget = () => {
 
         if (!res.ok) {
           const rid =
-            (data && data.requestId && ` · id=${data.requestId}`) ||
-            (res.headers.get("x-request-id") &&
-              ` · id=${res.headers.get("x-request-id")}`) ||
-            "";
-          throw new Error((data.detail || data.error || `HTTP ${res.status}`) + rid);
+            data?.requestId ||
+            res.headers.get("x-request-id") ||
+            "unknown";
+          const msg = data?.detail || data?.error || `HTTP ${res.status}`;
+          throw new Error(`${msg} · id=${rid}`);
         }
 
         const reply =
@@ -156,9 +160,6 @@ const ChatbotWidget = () => {
           ts: Date.now(),
         };
         setMessages((m) => [...m, botMsg]);
-
-        // If you later bubble up checkoutUrl/clientSecret from Python,
-        // you can read them here: data.checkoutUrl / data.clientSecret
       } catch (err) {
         if (ac.signal.aborted) return;
         if (attempt < 2) {
@@ -288,7 +289,7 @@ const ChatbotWidget = () => {
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={onKeyDown}
               rows={1}
-              placeholder="Ask about dishes, orders…"
+              placeholder="Ask about dishes, cart, or checkout…"
               className="flex-1 border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-red-400 resize-none"
               aria-label="Type your message to TomatoAI"
             />
