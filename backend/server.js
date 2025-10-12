@@ -17,7 +17,8 @@ const port = process.env.PORT || 4000;
 /* Allow your frontend and custom headers used by the chat proxy */
 const ALLOWED_ORIGINS = [
   'http://localhost:5173',
-  process.env.FRONTEND_URL, // e.g. https://tomato-food-delivery-website-umber.vercel.app
+  process.env.FRONTEND_URL,
+  process.env.ADMIN_URL,
 ].filter(Boolean);
 
 app.use(
