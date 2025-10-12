@@ -29,7 +29,7 @@ app.use(
       return cb(new Error(`CORS: origin ${origin} not allowed`));
     },
     credentials: true,
-    methods: ['GET', 'POST', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: [
       'Content-Type',
       'Authorization',
@@ -38,6 +38,9 @@ app.use(
       'X-User-Cookie',
       'x-service-auth',
       'x-request-id',
+      // ⬇️ add your custom auth headers here
+      'token',
+      'X-Auth-Token',
     ],
   })
 );
@@ -51,7 +54,7 @@ app.use((req, res, next) => {
   }
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
   res.setHeader(
     'Access-Control-Allow-Headers',
     [
@@ -62,6 +65,9 @@ app.use((req, res, next) => {
       'X-User-Cookie',
       'x-service-auth',
       'x-request-id',
+      // ⬇️ mirror the same additions here
+      'token',
+      'X-Auth-Token',
     ].join(', ')
   );
   // Let the browser read these headers in JS (handy for debug & checkout flows)
