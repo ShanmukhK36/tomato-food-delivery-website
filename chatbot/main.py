@@ -857,29 +857,34 @@ class OrderClient:
         self.s = requests.Session()
         self.s.headers.update({"Accept": "application/json"})
 
+        # Forward auth in all the common places
         if jwt:
-            # keep both styles so downstream accepts either
             self.s.headers[USER_JWT_HEADER] = jwt
             self.s.headers["Authorization"] = f"Bearer {jwt}"
-
         if cookie:
-            # forward real cookie + custom header copy
             self.s.headers["Cookie"] = cookie
             self.s.headers[USER_COOKIE_HEADER] = cookie
 
     def _url(self, p: str) -> str:
         return f"{self.base}{p}"
 
+    def _safe_json(self, r: requests.Response):
+        try:
+            return r.json()
+        except Exception:
+            return {"raw": (r.text or "")[:500], "status": r.status_code}
+
     def _post_try(self, candidates: List[str], json: dict, timeout: float = 8.0):
         last_err = None
         for p in candidates:
             try:
                 r = self.s.post(self._url(p), json=json, timeout=timeout)
+                data = self._safe_json(r)
                 if 200 <= r.status_code < 300:
-                    return r.json()
-                last_err = f"{r.status_code} {r.text[:200]}"
+                    return data
+                last_err = f"{p} -> {r.status_code} {(r.text or '')[:200]}"
             except Exception as e:
-                last_err = str(e)
+                last_err = f"{p} -> {e}"
         raise RuntimeError(f"POST failed for {candidates}: {last_err}")
 
     def _get_try(self, candidates: List[str], timeout: float = 8.0):
@@ -887,34 +892,49 @@ class OrderClient:
         for p in candidates:
             try:
                 r = self.s.get(self._url(p), timeout=timeout)
+                data = self._safe_json(r)
                 if 200 <= r.status_code < 300:
-                    return r.json()
-                last_err = f"{r.status_code} {r.text[:200]}"
+                    return data
+                last_err = f"{p} -> {r.status_code} {(r.text or '')[:200]}"
             except Exception as e:
-                last_err = str(e)
+                last_err = f"{p} -> {e}"
         raise RuntimeError(f"GET failed for {candidates}: {last_err}")
 
     # ---- CART ----
     def add_to_cart(self, payload: AddToCartPayload, user_id: Optional[str] = None):
         body = {"itemId": payload.item_id, "qty": payload.qty, "modifiers": payload.modifiers or []}
         if user_id:
-            body["userId"] = user_id  # some APIs accept this for server-side cart scoping
+            body["userId"] = user_id
         return self._post_try(
-            candidates=["/cart/items", "/cart/add", "/cart"],
+            # your Node first, then fallbacks
+            candidates=["/cart/add", "/cart/items", "/cart"],
             json=body,
             timeout=6.0,
         )
 
     def get_cart(self, user_id: Optional[str] = None):
-        if user_id:
+        # Try GET first (if you exposed GET /cart/get), then POST fallback
+        try:
+            if user_id:
+                return self._get_try(
+                    candidates=[
+                        f"/cart/get?userId={user_id}",
+                        f"/cart?userId={user_id}",
+                        f"/cart/items?userId={user_id}",
+                        "/cart/get",
+                        "/cart/items",
+                        "/cart",
+                    ],
+                    timeout=6.0,
+                )
             return self._get_try(
-                candidates=[f"/cart?userId={user_id}", f"/cart/items?userId={user_id}", "/cart", "/cart/items"],
+                candidates=["/cart/get", "/cart/items", "/cart"],
                 timeout=6.0,
             )
-        return self._get_try(
-            candidates=["/cart", "/cart/items"],
-            timeout=6.0,
-        )
+        except Exception:
+            # Some templates only have POST /cart/get
+            body = {"userId": user_id} if user_id else {}
+            return self._post_try(candidates=["/cart/get"], json=body, timeout=6.0)
 
     # ---- ORDER / CHECKOUT ----
     def checkout(self, payload: CheckoutPayload):
@@ -924,12 +944,13 @@ class OrderClient:
             "method": payload.method,
         }
         return self._post_try(
-            candidates=["/order/checkout-session", "/order/checkout", "/order"],
+            candidates=["/order/place", "/order/checkout-session", "/order/checkout", "/order"],
             json=body,
             timeout=10.0,
         )
 
     def confirm(self, payload: ConfirmPayload):
+        # Usually not needed for Stripe Checkout, but keep as fallback
         return self._post_try(
             candidates=["/order/confirm", "/order/complete", "/order/finalize"],
             json={"paymentIntentId": payload.payment_intent_id},
@@ -1273,16 +1294,34 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
         if t == "show_cart":
             try:
                 cart = oc.get_cart(user_id=user_id)
-                items = cart.get("items") or []
+
+                # 🔧 Normalize different backend shapes
+                payload = cart or {}
+                items = (
+                    payload.get("items")
+                    or payload.get("cart", {}).get("items")
+                    or payload.get("data", {}).get("items")
+                    or payload.get("result", {}).get("items")
+                    or []
+                )
+                # Some APIs return the items array at top level
+                if isinstance(payload, list):
+                    items = payload
+
                 if not items:
                     if response is not None:
                         response.headers["X-Answer-Source"] = "order:cart_empty"
                     return ChatResp(reply="Your cart is empty. Say “add Veg Noodles x 1”.")
+
                 parts = []
                 for it in items[:5]:
-                    nm = (it.get("name") or it.get("itemId") or 'item').strip()
-                    q = int(it.get("qty") or 1)
+                    nm = (
+                        (it.get("name") or it.get("itemId") or it.get("title") or it.get("product") or "item")
+                        .strip()
+                    )
+                    q = int(it.get("qty") or it.get("quantity") or 1)
                     parts.append(f"{nm} ×{q}")
+
                 more = max(0, len(items) - len(parts))
                 suffix = f" (+{more} more)" if more else ""
                 if response is not None:
@@ -1299,7 +1338,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             method = slots.get("payment_method", "card")
             try:
                 res = oc.checkout(CheckoutPayload(address=addr, contact=contact, method=method))
-                checkout_url = res.get("checkoutUrl") or res.get("url") or ""
+                checkout_url = (res.get("session_url") or res.get("checkoutUrl") or res.get("url") or "")
                 client_secret = res.get("clientSecret") or ""
                 if response is not None:
                     response.headers["X-Answer-Source"] = "order:checkout"
