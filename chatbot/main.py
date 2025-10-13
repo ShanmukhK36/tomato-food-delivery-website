@@ -475,7 +475,7 @@ def _summarize_items(items, max_items=3):
         if len(parts) < max_items and name:
             parts.append(f"{name} ×{qty}")
     more = max(0, len(items) - len(parts))
-    preview = ", ".join(parts) + (f", +{more} more}" if more > 0 else "")
+    preview = ", ".join(parts) + (f", +{more} more" if more > 0 else "")
     return total_qty, preview
 
 def get_user_recent_orders_detailed(user_id: Optional[str], limit=MAX_RECENT):
@@ -854,11 +854,10 @@ class OrderClient:
         self.s = requests.Session()
         self.s.headers.update({"Accept": "application/json"})
 
-        # Forward auth everywhere your Node API might look
+        # Forward auth in all the common places
         if jwt:
             self.s.headers[USER_JWT_HEADER] = jwt
             self.s.headers["Authorization"] = f"Bearer {jwt}"
-            self.s.headers["token"] = jwt  # <-- important for /api/cart/*
         if cookie:
             self.s.headers["Cookie"] = cookie
             self.s.headers[USER_COOKIE_HEADER] = cookie
@@ -904,12 +903,14 @@ class OrderClient:
         if user_id:
             body["userId"] = user_id
         return self._post_try(
+            # your Node first, then fallbacks
             candidates=["/cart/add", "/cart/items", "/cart"],
             json=body,
             timeout=6.0,
         )
 
     def get_cart(self, user_id: Optional[str] = None):
+        # Try GET first (if you exposed GET /cart/get), then POST fallback
         try:
             if user_id:
                 return self._get_try(
@@ -928,6 +929,7 @@ class OrderClient:
                 timeout=6.0,
             )
         except Exception:
+            # Some templates only have POST /cart/get
             body = {"userId": user_id} if user_id else {}
             return self._post_try(candidates=["/cart/get"], json=body, timeout=6.0)
 
@@ -945,6 +947,7 @@ class OrderClient:
         )
 
     def confirm(self, payload: ConfirmPayload):
+        # Usually not needed for Stripe Checkout, but keep as fallback
         return self._post_try(
             candidates=["/order/confirm", "/order/complete", "/order/finalize"],
             json={"paymentIntentId": payload.payment_intent_id},
@@ -998,10 +1001,9 @@ def map_to_menu_items(requested: list):
     for r in requested:
         cands = find_item_candidates_by_name(r["name"], limit=1)
         if cands:
-            c = cands[0]
-            _id = str(c.get("_id") or "")
+            _id = str(cands[0].get("_id") or "")
             if _id:
-                results.append({"item_id": _id, "qty": r["qty"], "name": c.get("name", "")})
+                results.append({"item_id": _id, "qty": r["qty"]})
     return results
 
 def extract_payment_method(text: str) -> str:
@@ -1223,7 +1225,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
     # === ORDERING (cart, checkout, confirm) ===
     action = extract_action(user_msg)
     if action and ORDER_API_BASE:
-        # Collect auth from either custom headers or standard Authorization
+        # --- NEW: collect auth from either custom headers or standard Authorization ---
         jwt_token = ""
         fwd_cookie = ""
         if request:
@@ -1267,14 +1269,13 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             added, failed = [], []
             for it in slots.get("items", []):
                 try:
-                    item_id = it.get("item_id")
+                    item_id = it.get("item_id") or it.get("name")
                     qty = int(it.get("qty", 1)) or 1
                     _ = oc.add_to_cart(AddToCartPayload(item_id=item_id, qty=qty, modifiers=[]), user_id=user_id)
-                    # bump popularity by *name* when available
-                    bump_food_orders([{"name": it.get("name") or "", "qty": qty}])
-                    added.append(f'{(it.get("name") or item_id)} ×{qty}')
+                    bump_food_orders([{"item_id": item_id, "qty": qty}])
+                    added.append(f'{item_id} ×{qty}')
                 except Exception:
-                    failed.append(it.get("name") or it.get("item_id") or "item")
+                    failed.append(it.get("item_id") or it.get("name") or "item")
             if response is not None:
                 response.headers["X-Answer-Source"] = "order:add_multi"
                 response.headers["X-Cart-Should-Refresh"] = "1"
@@ -1294,6 +1295,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             try:
                 cart = oc.get_cart(user_id=user_id)
 
+                # 🔧 Normalize different backend shapes
                 payload = cart or {}
                 items = (
                     payload.get("items")
@@ -1302,6 +1304,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                     or payload.get("result", {}).get("items")
                     or []
                 )
+                # Some APIs return the items array at top level
                 if isinstance(payload, list):
                     items = payload
 
@@ -1312,7 +1315,10 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
 
                 parts = []
                 for it in items[:5]:
-                    nm = ((it.get("name") or it.get("itemId") or it.get("title") or it.get("product") or "item").strip())
+                    nm = (
+                        (it.get("name") or it.get("itemId") or it.get("title") or it.get("product") or "item")
+                        .strip()
+                    )
                     q = int(it.get("qty") or it.get("quantity") or 1)
                     parts.append(f"{nm} ×{q}")
 
