@@ -39,7 +39,7 @@ app.use(
       'X-User-Cookie',
       'x-service-auth',
       'x-request-id',
-      // ⬇️ add your custom auth headers here
+      'X-Cart-Should-Refresh', 
       'token',
       'X-Auth-Token',
     ],
@@ -66,7 +66,6 @@ app.use((req, res, next) => {
       'X-User-Cookie',
       'x-service-auth',
       'x-request-id',
-      // ⬇️ mirror the same additions here
       'token',
       'X-Auth-Token',
     ].join(', ')
@@ -81,6 +80,7 @@ app.use((req, res, next) => {
       'X-Client-Secret',
       'X-Order-Id',
       'X-Echo-UserId',
+      'X-Cart-Should-Refresh',
     ].join(', ')
   );
   if (req.method === 'OPTIONS') return res.status(204).end();

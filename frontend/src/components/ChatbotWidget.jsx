@@ -127,12 +127,21 @@ const ChatbotWidget = () => {
 
         const res = await fetch(`${url}/api/chat`, {
           method: "POST",
-          credentials: "include", // 🔴 ensures browser sends your login cookies
+          credentials: "include", // ensures browser sends your login cookies
           headers,
           // Do NOT send userId in body — backend derives from JWT/cookie
           body: JSON.stringify({ message: text }),
           signal: ac.signal,
         });
+
+        // If the bot added items (order:add_multi) or explicitly says to refresh,
+        // notify the StoreContext to reload the cart from the backend
+        const shouldRefresh =
+          res.headers.get("X-Cart-Should-Refresh") === "1" ||
+          res.headers.get("X-Answer-Source") === "order:add_multi";
+        if (shouldRefresh) {
+          window.dispatchEvent(new CustomEvent("cart:refresh"));
+        }
 
         let data = {};
         try {

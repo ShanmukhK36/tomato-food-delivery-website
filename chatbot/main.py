@@ -361,22 +361,19 @@ def find_item_candidates_by_name(query: str, limit: int = 5):
     if not q:
         return []
     try:
-        # exact case-insensitive
+        proj = {"_id": 1, "name": 1, "price": 1, "category": 1, "description": 1}
+
         exact = list(db["foods"].find(
-            {"name": {"$regex": f"^{re.escape(query)}$", "$options": "i"}},
-            {"_id": 0, "name": 1, "price": 1, "category": 1, "description": 1}
+            {"name": {"$regex": f"^{re.escape(query)}$", "$options": "i"}}, proj
         ).limit(1))
         if exact:
             return exact
 
-        # contains search
         contains = list(db["foods"].find(
-            {"name": {"$regex": re.escape(query), "$options": "i"}},
-            {"_id": 0, "name": 1, "price": 1, "category": 1, "description": 1}
+            {"name": {"$regex": re.escape(query), "$options": "i"}}, proj
         ).limit(limit * 3))
 
-        # fallback to all names if nothing contains
-        pool = contains or list(db["foods"].find({}, {"_id": 0, "name": 1, "price": 1, "category": 1, "description": 1}))
+        pool = contains or list(db["foods"].find({}, proj))
 
         ranked = []
         for doc in pool:
@@ -1004,7 +1001,9 @@ def map_to_menu_items(requested: list):
     for r in requested:
         cands = find_item_candidates_by_name(r["name"], limit=1)
         if cands:
-            results.append({"item_id": cands[0]["name"], "qty": r["qty"]})
+            _id = str(cands[0].get("_id") or "")
+            if _id:
+                results.append({"item_id": _id, "qty": r["qty"]})
     return results
 
 def extract_payment_method(text: str) -> str:
@@ -1279,6 +1278,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                     failed.append(it.get("item_id") or it.get("name") or "item")
             if response is not None:
                 response.headers["X-Answer-Source"] = "order:add_multi"
+                response.headers["X-Cart-Should-Refresh"] = "1"
             if added and not failed:
                 return ChatResp(reply=f"Added: {', '.join(added)}. Say “show cart” or “checkout”.")
             if added and failed:
