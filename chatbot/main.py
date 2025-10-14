@@ -858,6 +858,7 @@ class OrderClient:
         if jwt:
             self.s.headers[USER_JWT_HEADER] = jwt
             self.s.headers["Authorization"] = f"Bearer {jwt}"
+            self.s.headers["token"] = jwt
         if cookie:
             self.s.headers["Cookie"] = cookie
             self.s.headers[USER_COOKIE_HEADER] = cookie
@@ -910,7 +911,6 @@ class OrderClient:
         )
 
     def get_cart(self, user_id: Optional[str] = None):
-        # Try GET first (if you exposed GET /cart/get), then POST fallback
         try:
             if user_id:
                 return self._get_try(
@@ -929,9 +929,7 @@ class OrderClient:
                 timeout=6.0,
             )
         except Exception:
-            # Some templates only have POST /cart/get
-            body = {"userId": user_id} if user_id else {}
-            return self._post_try(candidates=["/cart/get"], json=body, timeout=6.0)
+            return self._post_try(candidates=["/cart/get"], json={}, timeout=6.0)
 
     # ---- ORDER / CHECKOUT ----
     def checkout(self, payload: CheckoutPayload):
@@ -1002,8 +1000,9 @@ def map_to_menu_items(requested: list):
         cands = find_item_candidates_by_name(r["name"], limit=1)
         if cands:
             _id = str(cands[0].get("_id") or "")
+            nm  = cands[0].get("name") or r["name"]
             if _id:
-                results.append({"item_id": _id, "qty": r["qty"]})
+                results.append({"item_id": _id, "display": nm, "qty": r["qty"]})
     return results
 
 def extract_payment_method(text: str) -> str:
@@ -1272,10 +1271,10 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                     item_id = it.get("item_id") or it.get("name")
                     qty = int(it.get("qty", 1)) or 1
                     _ = oc.add_to_cart(AddToCartPayload(item_id=item_id, qty=qty, modifiers=[]), user_id=user_id)
-                    bump_food_orders([{"item_id": item_id, "qty": qty}])
-                    added.append(f'{item_id} ×{qty}')
+                    bump_food_orders([{"item_id": it.get("display") or item_id, "qty": qty}])
+                    added.append(f"{(it.get('display') or item_id)} ×{qty}")
                 except Exception:
-                    failed.append(it.get("item_id") or it.get("name") or "item")
+                    failed.append(it.get("display") or it.get("item_id") or it.get("name") or "item")
             if response is not None:
                 response.headers["X-Answer-Source"] = "order:add_multi"
                 response.headers["X-Cart-Should-Refresh"] = "1"
