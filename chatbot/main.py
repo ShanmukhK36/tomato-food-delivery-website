@@ -1265,9 +1265,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             fwd_cookie = request.headers.get(USER_COOKIE_HEADER, "") or ""
 
         if REQUIRE_AUTH_FOR_ORDER and not (jwt_token or fwd_cookie):
-            txt = ("Please log in to your account, then try again from the same browser/app. "
-                   f"Your frontend should forward auth via {USER_JWT_HEADER} or {USER_COOKIE_HEADER}, "
-                   "or a standard Authorization: Bearer <token> header.")
+            txt = ("Please log in to your account, then try again from the same browser.")
             if response is not None:
                 response.headers["X-Answer-Source"] = "order:auth_missing"
                 response.headers["X-Debug-Auth-HasJWT"] = "0"
