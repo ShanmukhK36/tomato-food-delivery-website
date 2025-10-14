@@ -515,6 +515,34 @@ def get_user_recent_orders_detailed(user_id: Optional[str], limit=MAX_RECENT):
         log.exception("get_user_recent_orders_detailed failed")
         return []
 
+def _items_from_cart_map(cart_map: dict):
+    """Convert {<foodId>: qty} map from Node cart API into [{name, qty}] using foods collection."""
+    if not isinstance(cart_map, dict) or not cart_map or db is None:
+        return []
+    ids = []
+    if ObjectId:
+        for k in cart_map.keys():
+            try:
+                ids.append(ObjectId(k))
+            except Exception:
+                pass
+    name_by_id: Dict[str, str] = {}
+    try:
+        if ids:
+            cur = db["foods"].find({"_id": {"$in": ids}}, {"_id": 1, "name": 1})
+            for d in cur:
+                name_by_id[str(d["_id"])] = d.get("name") or str(d["_id"])
+    except Exception:
+        # fallback: leave map keys as-is
+        pass
+
+    items = []
+    for k, v in cart_map.items():
+        qty = int(v or 1)
+        name = name_by_id.get(str(k), str(k))
+        items.append({"name": name, "qty": qty})
+    return items
+
 # -------- Last payment / transaction helpers --------
 _PAYMENT_STATUS_KEYWORDS = (
     "why my previous transaction got failed",
@@ -1303,28 +1331,43 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                     or payload.get("result", {}).get("items")
                     or []
                 )
-                # Some APIs return the items array at top level
-                if isinstance(payload, list):
-                    items = payload
+
+                # Handle Node template shape: { success, cartData: { "<foodId>": qty, ... } }
+                if not items:
+                    cart_map = (
+                        payload.get("cartData")
+                        or payload.get("data", {}).get("cartData")
+                        or {}
+                    )
+                    if isinstance(cart_map, dict) and cart_map:
+                        items = _items_from_cart_map(cart_map)
 
                 if not items:
                     if response is not None:
                         response.headers["X-Answer-Source"] = "order:cart_empty"
                     return ChatResp(reply="Your cart is empty. Say “add Veg Noodles x 1”.")
 
+                # Build a friendly preview
                 parts = []
                 for it in items[:5]:
                     nm = (
-                        (it.get("name") or it.get("itemId") or it.get("title") or it.get("product") or "item")
-                        .strip()
+                        (it.get("name")
+                         or it.get("itemId")
+                         or it.get("title")
+                         or it.get("product")
+                         or "item").strip()
                     )
                     q = int(it.get("qty") or it.get("quantity") or 1)
                     parts.append(f"{nm} ×{q}")
 
                 more = max(0, len(items) - len(parts))
                 suffix = f" (+{more} more)" if more else ""
+
                 if response is not None:
                     response.headers["X-Answer-Source"] = "order:show_cart"
+                    # Let the frontend know it should refresh its StoreContext cart
+                    response.headers["X-Cart-Should-Refresh"] = "1"
+
                 return ChatResp(reply=f"In your cart: {', '.join(parts)}{suffix}. Say “checkout” to continue.")
             except Exception as e:
                 log.error("get_cart failed for user_id=%s: %s", user_id, e)
