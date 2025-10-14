@@ -6,12 +6,12 @@ const router = express.Router();
 
 const PY_CHAT_URL = process.env.PY_CHAT_URL ?? "http://localhost:8000/chat";
 const SHARED_SECRET = process.env.SHARED_SECRET ?? "dev-secret";
-const JWT_KEY = process.env.JWT_KEY; // must match your user controller
+const JWT_KEY = process.env.JWT_KEY; // must match what you use to sign user JWTs
 const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS ?? 8000);
 const MAX_MESSAGE_LEN = Number(process.env.MAX_MESSAGE_LEN ?? 2000);
-const MAX_RETRIES = Number(process.env.UPSTREAM_RETRIES ?? 2); // total attempts
+const MAX_RETRIES = Number(process.env.UPSTREAM_RETRIES ?? 2);
 
-// ---------- CORS (allow your web app origin) ----------
+// ---------- CORS for this route (keeps things explicit) ----------
 const FRONTEND_URL =
   process.env.FRONTEND_URL ||
   "https://tomato-food-delivery-website-umber.vercel.app";
@@ -22,10 +22,8 @@ router.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
   res.setHeader("Vary", "Origin");
-
   res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  // IMPORTANT: include custom headers used by the frontend
   res.setHeader(
     "Access-Control-Allow-Headers",
     [
@@ -35,6 +33,20 @@ router.use((req, res, next) => {
       "X-User-JWT",
       "X-User-Cookie",
       "x-service-auth",
+      "x-request-id",
+    ].join(", ")
+  );
+  // Let the browser read debug/checkout headers
+  res.setHeader(
+    "Access-Control-Expose-Headers",
+    [
+      "X-Answer-Source",
+      "X-Request-Id",
+      "X-Cart-Should-Refresh",
+      "X-Checkout-Url",
+      "X-Client-Secret",
+      "X-Order-Id",
+      "X-Echo-UserId",
     ].join(", ")
   );
 
@@ -50,11 +62,9 @@ function validateBody(body) {
   if (msg.length > MAX_MESSAGE_LEN) return `message too long (>${MAX_MESSAGE_LEN})`;
   return null;
 }
-
 function logJSON(level, obj) {
   (console[level] || console.log)(JSON.stringify(obj));
 }
-
 async function fetchWithTimeout(url, init, timeoutMs) {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(new Error("upstream timeout")), timeoutMs);
@@ -64,7 +74,6 @@ async function fetchWithTimeout(url, init, timeoutMs) {
     clearTimeout(t);
   }
 }
-
 // ----- JWT / userId derivation -----
 function getBearerToken(req) {
   const auth = req.headers.authorization || req.headers.Authorization;
@@ -73,20 +82,13 @@ function getBearerToken(req) {
   }
   return null;
 }
-
 function getCookieToken(req) {
   const raw = req.headers.cookie;
   if (!raw) return null;
-  const parts = raw.split(";").map((s) => s.trim());
-  const pair = parts.find((p) => p.startsWith("token="));
+  const pair = raw.split(";").map(s => s.trim()).find(p => p.startsWith("token="));
   if (!pair) return null;
   return decodeURIComponent(pair.split("=").slice(1).join("="));
 }
-
-/**
- * Return userId from a verified JWT ({ id: <mongoId> }) or null.
- * If no valid JWT, allow a DEV-ONLY override via header/query.
- */
 function getUserIdFromRequest(req) {
   try {
     const token = getBearerToken(req) || getCookieToken(req);
@@ -94,10 +96,7 @@ function getUserIdFromRequest(req) {
       const payload = jwt.verify(token, JWT_KEY);
       if (payload?.id) return String(payload.id);
     }
-  } catch {
-    // invalid/expired token → fall through to debug overrides
-  }
-
+  } catch { /* ignore */ }
   const debugHeader = req.headers["x-debug-userid"];
   const debugQuery = req.query?.debug_user_id;
   const override =
@@ -106,35 +105,28 @@ function getUserIdFromRequest(req) {
   return override || null;
 }
 
-// ---------------- Route ----------------
+// ---------------- /api/chat ----------------
 router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
   const reqId = req.headers["x-request-id"] || randomUUID();
 
   const errMsg = validateBody(req.body);
-  if (errMsg) {
-    return res.status(400).json({ error: errMsg, requestId: reqId });
-  }
+  if (errMsg) return res.status(400).json({ error: errMsg, requestId: reqId });
 
   const message = String(req.body.message).trim();
-
-  // Derive userId from JWT (or debug override). Do NOT trust client body.
   const userId = getUserIdFromRequest(req) || undefined;
-
-  // Build upstream request (only include userId if present)
   const upstreamBody = userId ? { message, userId } : { message };
 
-  // Forward auth headers to Python so it can call /api/cart and /api/order
-  const xUserJwt = req.get("X-User-JWT") || "";           // from browser
-  const xUserCookie = req.get("X-User-Cookie") || req.headers.cookie || ""; // browser cookies if any
+  // Forward auth headers so FastAPI can call /cart & /order
+  const xUserJwt = req.get("X-User-JWT") || "";
+  const xUserCookie = req.get("X-User-Cookie") || req.headers.cookie || "";
   const authHeader = req.get("Authorization") || "";
 
   const buildInit = () => ({
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-service-auth": SHARED_SECRET, // must match FastAPI SHARED_SECRET
+      "x-service-auth": SHARED_SECRET, // must equal FastAPI SHARED_SECRET
       "x-request-id": reqId,
-      // pass through auth so FastAPI can see it and attach to OrderClient
       "X-User-JWT": xUserJwt,
       "X-User-Cookie": xUserCookie,
       "Authorization": authHeader,
@@ -142,84 +134,90 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     body: JSON.stringify(upstreamBody),
   });
 
-  const tryOnce = async () =>
-    fetchWithTimeout(PY_CHAT_URL, buildInit(), UPSTREAM_TIMEOUT_MS);
+  const tryOnce = () => fetchWithTimeout(PY_CHAT_URL, buildInit(), UPSTREAM_TIMEOUT_MS);
 
   let upstreamRes;
   let attempt = 0;
   let lastErr;
-
   while (attempt < MAX_RETRIES) {
     attempt++;
     try {
       upstreamRes = await tryOnce();
       if ([502, 503, 504].includes(upstreamRes.status) && attempt < MAX_RETRIES) {
-        await new Promise((r) => setTimeout(r, 250 * attempt));
+        await new Promise(r => setTimeout(r, 250 * attempt));
         continue;
       }
       break;
     } catch (e) {
       lastErr = e;
       if (attempt >= MAX_RETRIES) break;
-      await new Promise((r) => setTimeout(r, 250 * attempt));
+      await new Promise(r => setTimeout(r, 250 * attempt));
     }
   }
 
   if (!upstreamRes) {
-    logJSON("error", {
-      reqId,
-      route: "/api/chat",
-      msg: "no upstream response",
-      error: String(lastErr),
-    });
+    logJSON("error", { reqId, route: "/api/chat", msg: "no upstream response", error: String(lastErr) });
     return res.status(502).json({ error: "Chat service unavailable", requestId: reqId });
   }
 
-  const passthroughStatus = upstreamRes.status >= 500 ? 502 : upstreamRes.status;
-
-  // Capture upstream headers (and bubble useful ones)
-  const upstreamAnswerSource = upstreamRes.headers.get("x-answer-source") || undefined;
   const upstreamReqId = upstreamRes.headers.get("x-request-id") || reqId;
+  const upstreamAnswerSource = upstreamRes.headers.get("x-answer-source") || undefined;
   const upstreamEchoUserId = upstreamRes.headers.get("x-echo-userid") || "";
 
-  // Optional: pass through checkout/payment metadata if FastAPI sets them
-  const checkoutUrl = upstreamRes.headers.get("x-checkout-url");
-  const clientSecret = upstreamRes.headers.get("x-client-secret");
-  const orderId = upstreamRes.headers.get("x-order-id");
-  if (checkoutUrl) res.setHeader("X-Checkout-Url", checkoutUrl);
-  if (clientSecret) res.setHeader("X-Client-Secret", clientSecret);
-  if (orderId) res.setHeader("X-Order-Id", orderId);
+  // Bubble back useful headers (incl. cart refresh)
+  const expose = {
+    "X-Answer-Source": upstreamAnswerSource,
+    "X-Request-Id": upstreamReqId,
+    "X-Echo-UserId": upstreamEchoUserId,
+    "X-Cart-Should-Refresh": upstreamRes.headers.get("x-cart-should-refresh"),
+    "X-Checkout-Url": upstreamRes.headers.get("x-checkout-url"),
+    "X-Client-Secret": upstreamRes.headers.get("x-client-secret"),
+    "X-Order-Id": upstreamRes.headers.get("x-order-id"),
+  };
+  Object.entries(expose).forEach(([k, v]) => v && res.setHeader(k, v));
 
+  const ct = (upstreamRes.headers.get("content-type") || "").toLowerCase();
   let data;
-  const isJson = upstreamRes.headers.get("content-type")?.includes("application/json");
   try {
-    data = isJson
-      ? await upstreamRes.json()
-      : { error: "Invalid content-type from chatbot service" };
-  } catch {
-    data = { error: "Invalid JSON response from chatbot service" };
-  }
-
-  if (passthroughStatus < 400 && (typeof data?.reply !== "string" || data.reply.length === 0)) {
-    data = { reply: "" };
-  }
-
-  if (data && typeof data === "object") {
-    if (upstreamAnswerSource && data.answerSource == null) {
-      data.answerSource = upstreamAnswerSource;
+    if (ct.includes("application/json")) {
+      data = await upstreamRes.json();
+    } else {
+      const raw = await upstreamRes.text();
+      data = {
+        error: "upstream_not_json",
+        status: upstreamRes.status,
+        contentType: ct || "unknown",
+        raw: raw.slice(0, 1000),
+      };
     }
-    data.echoUserId = upstreamEchoUserId || null; // what FastAPI received
-    data.attachedUserId = userId || null;        // what we derived
+  } catch {
+    data = { error: "upstream_parse_error", status: upstreamRes.status };
   }
 
-  if (upstreamAnswerSource) res.setHeader("X-Answer-Source", upstreamAnswerSource);
-  if (upstreamEchoUserId)   res.setHeader("X-Echo-UserId", upstreamEchoUserId);
-  res.setHeader("X-Request-Id", upstreamReqId);
+  // Map 5xx to 502 so the browser knows it's a gateway issue
+  const passthroughStatus = upstreamRes.status >= 500 ? 502 : upstreamRes.status;
+
+  // Ensure we always send a JSON object and include IDs
+  if (typeof data !== "object" || data === null) data = {};
+  if (upstreamAnswerSource && data.answerSource == null) data.answerSource = upstreamAnswerSource;
+  data.requestId = upstreamReqId;
+  data.echoUserId = upstreamEchoUserId || null;
+  data.attachedUserId = userId || null;
+
+  // If success but no reply string, normalize to empty reply
+  if (passthroughStatus < 400 && (typeof data.reply !== "string")) {
+    data.reply = typeof data.raw === "string"
+      ? `Sorry — upstream error: ${data.raw.slice(0, 240)}`
+      : (data.reply ?? "");
+  }
+
   res.setHeader("Cache-Control", "no-store");
 
   logJSON("info", {
     reqId,
     route: "POST /api/chat",
+    upstreamUrl: PY_CHAT_URL,
+    contentType: ct || "unknown",
     upstreamStatus: upstreamRes.status,
     mappedStatus: passthroughStatus,
     len: message.length,
@@ -231,7 +229,7 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     fwdCookie: Boolean(xUserCookie),
   });
 
-  return res.status(passthroughStatus).json({ ...data, requestId: upstreamReqId });
+  return res.status(passthroughStatus).json(data);
 });
 
 export default router;
