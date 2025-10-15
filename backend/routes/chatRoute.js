@@ -74,6 +74,16 @@ async function fetchWithTimeout(url, init, timeoutMs) {
     clearTimeout(t);
   }
 }
+function shouldRefreshFromAnswerSource(src) {
+  if (!src) return false;
+  // any cart-affecting flows should refresh
+  return [
+    "order:add_multi",
+    "order:clear_cart",
+    "order:show_cart",
+    "order:cart_empty",
+  ].includes(src);
+}
 // ----- JWT / userId derivation -----
 function getBearerToken(req) {
   const auth = req.headers.authorization || req.headers.Authorization;
@@ -174,6 +184,10 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     "X-Client-Secret": upstreamRes.headers.get("x-client-secret"),
     "X-Order-Id": upstreamRes.headers.get("x-order-id"),
   };
+  // If upstream forgot to flag refresh but the flow requires it, set it here.
+  if (!expose["X-Cart-Should-Refresh"] && shouldRefreshFromAnswerSource(upstreamAnswerSource)) {
+    expose["X-Cart-Should-Refresh"] = "1";
+  }
   Object.entries(expose).forEach(([k, v]) => v && res.setHeader(k, v));
 
   const ct = (upstreamRes.headers.get("content-type") || "").toLowerCase();

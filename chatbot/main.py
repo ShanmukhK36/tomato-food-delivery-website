@@ -979,6 +979,40 @@ class OrderClient:
             json={"paymentIntentId": payload.payment_intent_id},
             timeout=8.0,
         )
+    # ---- CART (clear) ----
+    def clear_cart(self, user_id: Optional[str] = None):
+        # Prefer explicit clear endpoints, then DELETE fallbacks, then POST fallbacks.
+        # Body/query userId when available to match your existing add/get patterns.
+        q = f"?userId={user_id}" if user_id else ""
+        # Try POST-like clears
+        try:
+            return self._post_try(
+                candidates=[f"/cart/clear{q}", f"/cart/reset{q}", f"/cart/empty{q}"],
+                json={"userId": user_id} if user_id else {},
+                timeout=6.0,
+            )
+        except Exception:
+            pass
+        # Try DELETE-style clears (no body)
+        last_err = None
+        for p in [f"/cart/items{q}", f"/cart{q}"]:
+            try:
+                r = self.s.delete(self._url(p), timeout=6.0)
+                data = self._safe_json(r)
+                if 200 <= r.status_code < 300:
+                    return data
+                last_err = f"{p} -> {r.status_code} {(r.text or '')[:200]}"
+            except Exception as e:
+                last_err = f"{p} -> {e}"
+        # As absolute fallback, try POST to /cart with empty items map
+        try:
+            return self._post_try(
+                candidates=[f"/cart{q}"],
+                json={"items": {}, "userId": user_id} if user_id else {"items": {}},
+                timeout=6.0,
+            )
+        except Exception as e:
+            raise RuntimeError(f"clear_cart failed: {last_err or e}")
 
 # === ORDERING intent extraction (multi-item support) ===
 SHOW_CART_PATTERNS = (
@@ -990,6 +1024,11 @@ SHOW_CART_PATTERNS = (
     r"\bcart\b",
     r"\bbasket\b",
     r"\bbag\b",
+)
+CLEAR_CART_PATTERNS = (
+    r"\b(clear|empty|flush|clean|reset|remove\s+all)\b.*\b(cart|basket|bag)\b",
+    r"\b(clear|empty)\s*(my\s*)?(cart|basket|bag)\b",
+    r"\b(delete|remove)\s*(everything|all)\s*(from\s*)?(my\s*)?(cart|basket|bag)\b",
 )
 CHECKOUT_PATTERNS = (r"\b(check ?out|pay|proceed to payment|place (the )?order)\b",)
 CONFIRM_PATTERNS = (r"\b(confirm|finalize)\b.*\b(payment|order)\b",)
@@ -1065,6 +1104,10 @@ def extract_action(user_msg: str) -> Optional[dict]:
     for p in SHOW_CART_PATTERNS:
         if re.search(p, low, flags=re.IGNORECASE):
             return {"type": "show_cart", "slots": {}}
+    
+    for p in CLEAR_CART_PATTERNS:
+        if re.search(p, low, flags=re.IGNORECASE):
+            return {"type": "clear_cart", "slots": {}}
 
     if any(re.search(p, low) for p in CHECKOUT_PATTERNS):
         return {"type": "checkout", "slots": {"payment_method": extract_payment_method(low)}}
@@ -1372,6 +1415,43 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                 if REQUIRE_AUTH_FOR_ORDER:
                     return ChatResp(reply="I couldn’t load your cart. Please make sure you’re signed in and the app forwards your login to chat.")
                 return ChatResp(reply="I couldn’t load your cart. Please try again.")
+        
+        if t == "clear_cart":
+            try:
+                res = oc.clear_cart(user_id=user_id)
+
+                # Normalize shapes to detect success/emptiness
+                payload = res or {}
+                # Many Node templates respond with { success: true } or { cartData: {} } or { items: [] }
+                success_flag = bool(payload.get("success") in (True, "true", 1))
+                items = (
+                    payload.get("items")
+                    or payload.get("cart", {}).get("items")
+                    or payload.get("data", {}).get("items")
+                    or payload.get("result", {}).get("items")
+                    or []
+                )
+                cart_map = (
+                    payload.get("cartData")
+                    or payload.get("data", {}).get("cartData")
+                    or {}
+                )
+
+                cleared = success_flag or (isinstance(items, list) and len(items) == 0) or (isinstance(cart_map, dict) and len(cart_map) == 0)
+
+                if response is not None:
+                    response.headers["X-Answer-Source"] = "order:clear_cart"
+                    response.headers["X-Cart-Should-Refresh"] = "1"
+
+                if cleared:
+                    return ChatResp(reply="Your cart is now empty.")
+                # If backend didn’t clearly signal emptiness, still hint the next step
+                return ChatResp(reply="I tried to clear your cart. If anything remains, say “show cart” to refresh.")
+            except Exception as e:
+                log.error("clear_cart failed for user_id=%s: %s", user_id, e)
+                if REQUIRE_AUTH_FOR_ORDER:
+                    return ChatResp(reply="I couldn’t clear your cart. Please make sure you’re signed in and try again.")
+                return ChatResp(reply="I couldn’t clear your cart right now. Please try again.")
 
         if t == "checkout":
             addr, contact = extract_address_and_contact_from_mem(user_id)

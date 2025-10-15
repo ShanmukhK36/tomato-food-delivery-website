@@ -5,6 +5,18 @@ const uid = () => Math.random().toString(36).slice(2, 10);
 const getUserId = () => localStorage.getItem("userId") || "guest";
 const getToken = () => localStorage.getItem("token") || "";
 const keyFor = (userId) => `tomatoai:${userId}:messages`;
+const shouldRefreshCartFrom = (res) => {
+  const ans = res.headers.get("X-Answer-Source") || "";
+  const refreshFlag = res.headers.get("X-Cart-Should-Refresh") === "1";
+  // Refresh on explicit flag OR typical cart-affecting actions
+  return (
+    refreshFlag ||
+    ans === "order:add_multi" ||
+    ans === "order:clear_cart" ||
+    ans === "order:show_cart" ||
+    ans === "order:cart_empty"
+  );
+};
 
 const ChatbotWidget = () => {
   const { url } = useContext(StoreContext);
@@ -134,12 +146,7 @@ const ChatbotWidget = () => {
           signal: ac.signal,
         });
 
-        // If the bot added items (order:add_multi) or explicitly says to refresh,
-        // notify the StoreContext to reload the cart from the backend
-        const shouldRefresh =
-          res.headers.get("X-Cart-Should-Refresh") === "1" ||
-          res.headers.get("X-Answer-Source") === "order:add_multi";
-        if (shouldRefresh) {
+        if (shouldRefreshCartFrom(res)) {
           window.dispatchEvent(new CustomEvent("cart:refresh"));
         }
 
