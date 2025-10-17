@@ -516,7 +516,8 @@ def get_user_recent_orders_detailed(user_id: Optional[str], limit=MAX_RECENT):
         return []
 
 def _items_from_cart_map(cart_map: dict):
-    """Convert {<foodId>: qty} map from Node cart API into [{name, qty}] using foods collection."""
+    """Convert {<foodId>: qty} map into [{name, qty}] using foods collection.
+       Ignore zero/negative quantities."""
     if not isinstance(cart_map, dict) or not cart_map or db is None:
         return []
     ids = []
@@ -533,12 +534,16 @@ def _items_from_cart_map(cart_map: dict):
             for d in cur:
                 name_by_id[str(d["_id"])] = d.get("name") or str(d["_id"])
     except Exception:
-        # fallback: leave map keys as-is
         pass
 
     items = []
     for k, v in cart_map.items():
-        qty = int(v or 1)
+        try:
+            qty = int(v)
+        except Exception:
+            qty = 0
+        if qty <= 0:
+            continue  # <-- skip zeros (removed items)
         name = name_by_id.get(str(k), str(k))
         items.append({"name": name, "qty": qty})
     return items

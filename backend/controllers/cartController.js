@@ -20,19 +20,25 @@ const addToCart = async (req, res) => {
 
 // remove items from user cart
 const removeFromCart = async (req, res) => {
-    try {
-        let userData = await userModel.findById(req.body.userId);
-        let cartData = await userData.cartData;
-        if(cartData[req.body.itemId] > 0) {
-            cartData[req.body.itemId] -= 1;
-        } 
-        await userModel.findByIdAndUpdate(req.body.userId, {cartData});
-        res.json({success: true, message: 'Removed From Cart'});
-    } catch(error) {
-        console.log(error);
-        return res.json({success: false, message: error.message});
+  try {
+    let userData = await userModel.findById(req.body.userId);
+    let cartData = await userData.cartData;
+
+    if (cartData[req.body.itemId] > 0) {
+      cartData[req.body.itemId] -= 1;
+      // 🧹 If quantity becomes 0, delete the item entirely
+      if (cartData[req.body.itemId] === 0) {
+        delete cartData[req.body.itemId];
+      }
     }
-}
+
+    await userModel.findByIdAndUpdate(req.body.userId, { cartData });
+    res.json({ success: true, message: "Removed From Cart" });
+  } catch (error) {
+    console.log(error);
+    return res.json({ success: false, message: error.message });
+  }
+};
 
 // fetch user cart data
 const getCart = async (req, res) => {
@@ -90,69 +96,20 @@ const addManyToCart = async (req, res) => {
 // remove multiple items [{itemId, qty}] with per-item status
 const removeManyFromCart = async (req, res) => {
   try {
-    const userId = req.body?.userId;
-    const items = Array.isArray(req.body?.items) ? req.body.items : [];
-    if (!userId) return res.json({ success: false, message: "userId required" });
-    if (!items.length) return res.json({ success: false, message: "items array required" });
+    const user = await userModel.findById(req.body.userId);
+    const cartData = { ...(user.cartData || {}) };
 
-    const user = await userModel.findById(userId);
-    if (!user) return res.json({ success: false, message: "user not found" });
+    for (const { itemId, qty } of (req.body.items || [])) {
+      const n = Math.max(0, (cartData[itemId] || 0) - (Number(qty) || 1));
+      if (n <= 0) delete cartData[itemId];
+      else cartData[itemId] = n;
+    }
 
-    const cart = (user.cartData && typeof user.cartData === "object") ? user.cartData : {};
-
-    const results = items.map((it) => {
-      const itemId = it?.itemId;
-      const rawQty = it?.qty ?? 1;
-      const qty = Number.isFinite(Number(rawQty)) && Number(rawQty) > 0 ? Math.floor(Number(rawQty)) : 1;
-
-      if (!itemId) {
-        return { itemId: null, ok: false, code: "missing_itemId", message: "itemId required" };
-      }
-
-      const present = Number(cart[itemId] || 0);
-      if (!present) {
-        return {
-          itemId,
-          ok: false,
-          code: "not_in_cart",
-          message: "Item is not in the cart",
-          present: 0,
-          requestedRemove: qty,
-        };
-      }
-      if (qty > present) {
-        return {
-          itemId,
-          ok: false,
-          code: "insufficient_quantity",
-          message: "Requested quantity to remove exceeds the quantity in cart",
-          present,
-          requestedRemove: qty,
-        };
-      }
-
-      const newQty = present - qty;
-      if (newQty <= 0) {
-        delete cart[itemId];
-      } else {
-        cart[itemId] = newQty;
-      }
-
-      return { itemId, ok: true, removed: qty, newQty: cart[itemId] || 0 };
-    });
-
-    await userModel.findByIdAndUpdate(userId, { cartData: cart });
-
-    const changed = results.some(r => r.ok);
-    return res.json({
-      success: changed,
-      message: changed ? "Removed items" : "No items removed",
-      results,
-      cartData: cart,
-    });
+    await userModel.findByIdAndUpdate(req.body.userId, { cartData });
+    res.json({ success: true, message: "Removed multiple items", cartData });
   } catch (error) {
-    console.log(error);
-    return res.json({ success: false, message: error.message });
+    console.error(error);
+    res.json({ success: false, message: error.message });
   }
 };
 

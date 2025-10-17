@@ -17,19 +17,28 @@ const StoreContextProvider = (props) => {
 
   // --- Normalize cart payloads into a { [foodId]: qty } map
   const extractCartMap = (payload) => {
-    if (!payload || typeof payload !== 'object') return {};
-    if (payload.cartData && typeof payload.cartData === 'object') return payload.cartData;
-    if (payload.data?.cartData && typeof payload.data.cartData === 'object') return payload.data.cartData;
-    if (Array.isArray(payload.items)) {
+    if (!payload || typeof payload !== "object") return {};
+
+    let map = {};
+
+    if (payload.cartData && typeof payload.cartData === "object") {
+      map = payload.cartData;
+    } else if (payload.data?.cartData && typeof payload.data.cartData === "object") {
+      map = payload.data.cartData;
+    } else if (Array.isArray(payload.items)) {
       const out = {};
       for (const it of payload.items) {
         const id = it?._id || it?.itemId || it?.id;
-        const q  = Number(it?.qty ?? it?.quantity ?? 0);
+        const q = Number(it?.qty ?? it?.quantity ?? 0);
         if (id && q > 0) out[id] = (out[id] || 0) + q;
       }
-      return out;
+      map = out;
     }
-    return {};
+    const cleaned = Object.fromEntries(
+      Object.entries(map || {}).filter(([_, qty]) => Number(qty) > 0)
+    );
+
+    return cleaned;
   };
 
   // --- Refresh cart from backend (idempotent)
