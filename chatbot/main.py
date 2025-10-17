@@ -1363,42 +1363,58 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             try:
                 cart = oc.get_cart(user_id=user_id)
 
-                # 🔧 Normalize different backend shapes
-                payload = cart or {}
+                # 🔧 Be defensive about upstream shape
+                if not isinstance(cart, dict):
+                    log.warning("show_cart upstream not dict: %s", type(cart).__name__)
+                    cart = {}
+
+                payload = cart
                 items = (
                     payload.get("items")
-                    or payload.get("cart", {}).get("items")
-                    or payload.get("data", {}).get("items")
-                    or payload.get("result", {}).get("items")
+                    or (payload.get("cart") or {}).get("items")
+                    or (payload.get("data") or {}).get("items")
+                    or (payload.get("result") or {}).get("items")
                     or []
                 )
+
+                if not isinstance(items, list):
+                    log.warning("show_cart 'items' not list, coercing empty; was: %r", items)
+                    items = []
 
                 # Handle Node template shape: { success, cartData: { "<foodId>": qty, ... } }
                 if not items:
                     cart_map = (
                         payload.get("cartData")
-                        or payload.get("data", {}).get("cartData")
+                        or (payload.get("data") or {}).get("cartData")
                         or {}
                     )
                     if isinstance(cart_map, dict) and cart_map:
                         items = _items_from_cart_map(cart_map)
+                    elif cart_map and not isinstance(cart_map, dict):
+                        log.warning("show_cart cartData unexpected type: %s", type(cart_map).__name__)
 
                 if not items:
                     if response is not None:
                         response.headers["X-Answer-Source"] = "order:cart_empty"
+                        response.headers["X-Cart-Should-Refresh"] = "1"
                     return ChatResp(reply="Your cart is empty. Say “add Veg Noodles x 1”.")
 
                 # Build a friendly preview
                 parts = []
                 for it in items[:5]:
+                    it = it or {}
                     nm = (
-                        (it.get("name")
-                         or it.get("itemId")
-                         or it.get("title")
-                         or it.get("product")
-                         or "item").strip()
+                        it.get("name")
+                        or it.get("itemId")
+                        or it.get("title")
+                        or it.get("product")
+                        or "item"
                     )
-                    q = int(it.get("qty") or it.get("quantity") or 1)
+                    nm = (nm or "item").strip() if isinstance(nm, str) else "item"
+                    try:
+                        q = int(it.get("qty") or it.get("quantity") or 1)
+                    except Exception:
+                        q = 1
                     parts.append(f"{nm} ×{q}")
 
                 more = max(0, len(items) - len(parts))
@@ -1411,33 +1427,47 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
 
                 return ChatResp(reply=f"In your cart: {', '.join(parts)}{suffix}. Say “checkout” to continue.")
             except Exception as e:
-                log.error("get_cart failed for user_id=%s: %s", user_id, e)
+                if response is not None and request is not None:
+                    response.headers["X-Answer-Source"] = "order:show_cart_error"
+                    response.headers["X-Debug-Auth-HasJWT"] = "1" if request.headers.get(USER_JWT_HEADER) or request.headers.get("Authorization") else "0"
+                    response.headers["X-Debug-Auth-HasCookie"] = "1" if (request.headers.get(USER_COOKIE_HEADER) or "").strip() else "0"
+                log.exception("get_cart crashed (user_id=%s): %s", user_id, e)
+                msg = "I couldn’t load your cart."
                 if REQUIRE_AUTH_FOR_ORDER:
-                    return ChatResp(reply="I couldn’t load your cart. Please make sure you’re signed in and the app forwards your login to chat.")
-                return ChatResp(reply="I couldn’t load your cart. Please try again.")
+                    msg += " Please make sure you’re signed in and the app forwards your login to chat."
+                return ChatResp(reply=msg)
         
         if t == "clear_cart":
             try:
                 res = oc.clear_cart(user_id=user_id)
 
                 # Normalize shapes to detect success/emptiness
-                payload = res or {}
+                if not isinstance(res, dict):
+                    log.warning("clear_cart upstream not dict: %s", type(res).__name__)
+                    res = {}
+
+                payload = res
                 # Many Node templates respond with { success: true } or { cartData: {} } or { items: [] }
                 success_flag = bool(payload.get("success") in (True, "true", 1))
                 items = (
                     payload.get("items")
-                    or payload.get("cart", {}).get("items")
-                    or payload.get("data", {}).get("items")
-                    or payload.get("result", {}).get("items")
+                    or (payload.get("cart") or {}).get("items")
+                    or (payload.get("data") or {}).get("items")
+                    or (payload.get("result") or {}).get("items")
                     or []
                 )
+                if not isinstance(items, list):
+                    items = []
+
                 cart_map = (
                     payload.get("cartData")
-                    or payload.get("data", {}).get("cartData")
+                    or (payload.get("data") or {}).get("cartData")
                     or {}
                 )
+                if not isinstance(cart_map, dict):
+                    cart_map = {}
 
-                cleared = success_flag or (isinstance(items, list) and len(items) == 0) or (isinstance(cart_map, dict) and len(cart_map) == 0)
+                cleared = success_flag or (len(items) == 0 and len(cart_map) == 0)
 
                 if response is not None:
                     response.headers["X-Answer-Source"] = "order:clear_cart"
@@ -1448,10 +1478,15 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                 # If backend didn’t clearly signal emptiness, still hint the next step
                 return ChatResp(reply="I tried to clear your cart. If anything remains, say “show cart” to refresh.")
             except Exception as e:
-                log.error("clear_cart failed for user_id=%s: %s", user_id, e)
+                if response is not None and request is not None:
+                    response.headers["X-Answer-Source"] = "order:clear_cart_error"
+                    response.headers["X-Debug-Auth-HasJWT"] = "1" if request.headers.get(USER_JWT_HEADER) or request.headers.get("Authorization") else "0"
+                    response.headers["X-Debug-Auth-HasCookie"] = "1" if (request.headers.get(USER_COOKIE_HEADER) or "").strip() else "0"
+                log.exception("clear_cart crashed (user_id=%s): %s", user_id, e)
+                msg = "I couldn’t clear your cart."
                 if REQUIRE_AUTH_FOR_ORDER:
-                    return ChatResp(reply="I couldn’t clear your cart. Please make sure you’re signed in and try again.")
-                return ChatResp(reply="I couldn’t clear your cart right now. Please try again.")
+                    msg += " Please make sure you’re signed in and try again."
+                return ChatResp(reply=msg)
 
         if t == "checkout":
             addr, contact = extract_address_and_contact_from_mem(user_id)
