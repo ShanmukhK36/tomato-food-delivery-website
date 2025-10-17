@@ -932,7 +932,6 @@ class OrderClient:
         if user_id:
             body["userId"] = user_id
         return self._post_try(
-            # your Node first, then fallbacks
             candidates=["/cart/add", "/cart/items", "/cart"],
             json=body,
             timeout=6.0,
@@ -959,7 +958,6 @@ class OrderClient:
         except Exception:
             return self._post_try(candidates=["/cart/get"], json={}, timeout=6.0)
 
-    # ---- ORDER / CHECKOUT ----
     def checkout(self, payload: CheckoutPayload):
         body = {
             "address": payload.address,
@@ -973,46 +971,22 @@ class OrderClient:
         )
 
     def confirm(self, payload: ConfirmPayload):
-        # Usually not needed for Stripe Checkout, but keep as fallback
         return self._post_try(
             candidates=["/order/confirm", "/order/complete", "/order/finalize"],
             json={"paymentIntentId": payload.payment_intent_id},
             timeout=8.0,
         )
-    # ---- CART (clear) ----
-    def clear_cart(self, user_id: Optional[str] = None):
-        # Prefer explicit clear endpoints, then DELETE fallbacks, then POST fallbacks.
-        # Body/query userId when available to match your existing add/get patterns.
-        q = f"?userId={user_id}" if user_id else ""
-        # Try POST-like clears
-        try:
-            return self._post_try(
-                candidates=[f"/cart/clear{q}", f"/cart/reset{q}", f"/cart/empty{q}"],
-                json={"userId": user_id} if user_id else {},
-                timeout=6.0,
-            )
-        except Exception:
-            pass
-        # Try DELETE-style clears (no body)
-        last_err = None
-        for p in [f"/cart/items{q}", f"/cart{q}"]:
-            try:
-                r = self.s.delete(self._url(p), timeout=6.0)
-                data = self._safe_json(r)
-                if 200 <= r.status_code < 300:
-                    return data
-                last_err = f"{p} -> {r.status_code} {(r.text or '')[:200]}"
-            except Exception as e:
-                last_err = f"{p} -> {e}"
-        # As absolute fallback, try POST to /cart with empty items map
-        try:
-            return self._post_try(
-                candidates=[f"/cart{q}"],
-                json={"items": {}, "userId": user_id} if user_id else {"items": {}},
-                timeout=6.0,
-            )
-        except Exception as e:
-            raise RuntimeError(f"clear_cart failed: {last_err or e}")
+
+    def remove_from_cart(self, item_id: str, qty: int = 1, user_id: Optional[str] = None):
+        """Remove qty of an item from cart. Tries Node /cart/remove first, then fallbacks."""
+        body = {"itemId": item_id, "qty": max(1, int(qty))}
+        if user_id:
+            body["userId"] = user_id
+        return self._post_try(
+            candidates=["/cart/remove", "/cart/items/remove"],
+            json=body,
+            timeout=6.0,
+        )
 
 # === ORDERING intent extraction (multi-item support) ===
 SHOW_CART_PATTERNS = (
@@ -1025,14 +999,13 @@ SHOW_CART_PATTERNS = (
     r"\bbasket\b",
     r"\bbag\b",
 )
-CLEAR_CART_PATTERNS = (
-    r"\b(clear|empty|flush|clean|reset|remove\s+all)\b.*\b(cart|basket|bag)\b",
-    r"\b(clear|empty)\s*(my\s*)?(cart|basket|bag)\b",
-    r"\b(delete|remove)\s*(everything|all)\s*(from\s*)?(my\s*)?(cart|basket|bag)\b",
-)
+
 CHECKOUT_PATTERNS = (r"\b(check ?out|pay|proceed to payment|place (the )?order)\b",)
 CONFIRM_PATTERNS = (r"\b(confirm|finalize)\b.*\b(payment|order)\b",)
 ADD_PATTERNS = (r"\b(add|order|get|i'?ll have|i want)\b",)
+REMOVE_PATTERNS = (
+    r"\b(remove|delete|take\s*out|subtract)\b",
+)
 
 ITEM_QTY_PATTERN = re.compile(
     r"""
@@ -1097,13 +1070,84 @@ def extract_address_and_contact_from_mem(user_id: Optional[str]):
             pass
     return addr, contact
 
+def _foods_name_map_by_ids(ids: List[str]) -> Dict[str, str]:
+    """Return {id -> name} for foods `_id`s."""
+    out: Dict[str, str] = {}
+    if not ids or db is None:
+        return out
+    q_ids = []
+    if ObjectId:
+        for sid in ids:
+            try:
+                q_ids.append(ObjectId(sid))
+            except Exception:
+                pass
+    try:
+        if q_ids:
+            cur = db["foods"].find({"_id": {"$in": q_ids}}, {"_id": 1, "name": 1})
+            for d in cur:
+                out[str(d["_id"])] = d.get("name") or str(d["_id"])
+    except Exception:
+        pass
+    return out
+
+def _normalize_cart_items(payload: dict) -> List[Dict[str, Any]]:
+    """
+    Accepts any of your backend shapes and returns a list:
+    [{ "id": "<foodId>", "name": "<display name>", "qty": <int> }, ...]
+    """
+    items = (
+        (payload or {}).get("items")
+        or (payload or {}).get("cart", {}).get("items")
+        or (payload or {}).get("data", {}).get("items")
+        or (payload or {}).get("result", {}).get("items")
+        or []
+    )
+
+    # Node template shape: { cartData: { "<foodId>": qty } }
+    if not items:
+        cart_map = (
+            (payload or {}).get("cartData")
+            or (payload or {}).get("data", {}).get("cartData")
+            or {}
+        )
+        if isinstance(cart_map, dict) and cart_map:
+            ids = list(cart_map.keys())
+            name_map = _foods_name_map_by_ids(ids)
+            out = []
+            for sid, q in cart_map.items():
+                out.append({"id": sid, "name": name_map.get(sid, sid), "qty": int(q or 1)})
+            return out
+
+    out = []
+    ids_missing_names = []
+    for it in items:
+        iid = str(it.get("_id") or it.get("itemId") or it.get("id") or "").strip()
+        nm  = (it.get("name") or it.get("title") or it.get("product") or "").strip()
+        q   = int(it.get("qty") or it.get("quantity") or 1)
+        if not nm and iid:
+            ids_missing_names.append(iid)
+        out.append({"id": iid, "name": nm, "qty": q})
+
+    if ids_missing_names:
+        name_map = _foods_name_map_by_ids(ids_missing_names)
+        for it in out:
+            if not it["name"] and it["id"]:
+                it["name"] = name_map.get(it["id"], it["id"])
+    return out
+
+def _index_cart_by_name(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Case-insensitive index by display name."""
+    idx: Dict[str, Dict[str, Any]] = {}
+    for it in items:
+        key = (it.get("name") or "").strip().lower()
+        if key:
+            idx[key] = it
+    return idx
+
 def extract_action(user_msg: str) -> Optional[dict]:
     t = (user_msg or "").strip()
     low = t.lower()
-
-    for p in CLEAR_CART_PATTERNS:
-        if re.search(p, low, flags=re.IGNORECASE):
-            return {"type": "clear_cart", "slots": {}}
 
     for p in SHOW_CART_PATTERNS:
         if re.search(p, low, flags=re.IGNORECASE):
@@ -1126,6 +1170,16 @@ def extract_action(user_msg: str) -> Optional[dict]:
                 return {"type": "add_multiple", "slots": {"items": mapped}}
             return {"type": "disambiguate", "slots": {"choices": []}}
         return {"type": "prompt_for_items", "slots": {}}
+
+    # REMOVE items intent
+    if any(re.search(p, low) for p in REMOVE_PATTERNS):
+        items_req = parse_items_with_qty(t)
+        if items_req:
+            mapped = map_to_menu_items(items_req)
+            if mapped:
+                return {"type": "remove_multiple", "slots": {"items": mapped, "original": items_req}}
+            return {"type": "disambiguate", "slots": {"choices": []}}
+        return {"type": "prompt_for_remove", "slots": {}}
 
     return None
 
@@ -1292,10 +1346,10 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             response.headers["X-Orders-Count"] = "0"
         return ChatResp(reply=text)
 
-    # === ORDERING (cart, checkout, confirm) ===
+    # === ORDERING (cart, checkout, confirm, remove) ===
     action = extract_action(user_msg)
     if action and ORDER_API_BASE:
-        # --- NEW: collect auth from either custom headers or standard Authorization ---
+        # --- collect auth from either custom headers or standard Authorization ---
         jwt_token = ""
         fwd_cookie = ""
         if request:
@@ -1422,7 +1476,6 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
 
                 if response is not None:
                     response.headers["X-Answer-Source"] = "order:show_cart"
-                    # Let the frontend know it should refresh its StoreContext cart
                     response.headers["X-Cart-Should-Refresh"] = "1"
 
                 return ChatResp(reply=f"In your cart: {', '.join(parts)}{suffix}. Say “checkout” to continue.")
@@ -1435,57 +1488,6 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                 msg = "I couldn’t load your cart."
                 if REQUIRE_AUTH_FOR_ORDER:
                     msg += " Please make sure you’re signed in and the app forwards your login to chat."
-                return ChatResp(reply=msg)
-        
-        if t == "clear_cart":
-            try:
-                res = oc.clear_cart(user_id=user_id)
-
-                # Normalize shapes to detect success/emptiness
-                if not isinstance(res, dict):
-                    log.warning("clear_cart upstream not dict: %s", type(res).__name__)
-                    res = {}
-
-                payload = res
-                # Many Node templates respond with { success: true } or { cartData: {} } or { items: [] }
-                success_flag = bool(payload.get("success") in (True, "true", 1))
-                items = (
-                    payload.get("items")
-                    or (payload.get("cart") or {}).get("items")
-                    or (payload.get("data") or {}).get("items")
-                    or (payload.get("result") or {}).get("items")
-                    or []
-                )
-                if not isinstance(items, list):
-                    items = []
-
-                cart_map = (
-                    payload.get("cartData")
-                    or (payload.get("data") or {}).get("cartData")
-                    or {}
-                )
-                if not isinstance(cart_map, dict):
-                    cart_map = {}
-
-                cleared = success_flag or (len(items) == 0 and len(cart_map) == 0)
-
-                if response is not None:
-                    response.headers["X-Answer-Source"] = "order:clear_cart"
-                    response.headers["X-Cart-Should-Refresh"] = "1"
-
-                if cleared:
-                    return ChatResp(reply="Your cart is now empty.")
-                # If backend didn’t clearly signal emptiness, still hint the next step
-                return ChatResp(reply="I tried to clear your cart. If anything remains, say “show cart” to refresh.")
-            except Exception as e:
-                if response is not None and request is not None:
-                    response.headers["X-Answer-Source"] = "order:clear_cart_error"
-                    response.headers["X-Debug-Auth-HasJWT"] = "1" if request.headers.get(USER_JWT_HEADER) or request.headers.get("Authorization") else "0"
-                    response.headers["X-Debug-Auth-HasCookie"] = "1" if (request.headers.get(USER_COOKIE_HEADER) or "").strip() else "0"
-                log.exception("clear_cart crashed (user_id=%s): %s", user_id, e)
-                msg = "I couldn’t clear your cart."
-                if REQUIRE_AUTH_FOR_ORDER:
-                    msg += " Please make sure you’re signed in and try again."
                 return ChatResp(reply=msg)
 
         if t == "checkout":
@@ -1526,6 +1528,71 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             except Exception as e:
                 log.error("confirm failed: %s", e)
                 return ChatResp(reply="I couldn’t confirm that payment. If it succeeded, you’ll see the order in your history shortly.")
+
+        if t == "prompt_for_remove":
+            if response is not None:
+                response.headers["X-Answer-Source"] = "order:prompt_remove"
+            return ChatResp(reply='Tell me what to remove like: “remove Veg Noodles x 1, Clover Salad x 2”.')
+
+        if t == "remove_multiple":
+            try:
+                # Get current cart
+                cart_payload = oc.get_cart(user_id=user_id)
+                if not isinstance(cart_payload, dict):
+                    cart_payload = {}
+                current_items = _normalize_cart_items(cart_payload)
+                index_by_name = _index_cart_by_name(current_items)
+
+                removed_msgs = []
+                not_in_cart  = []
+                qty_too_high = []  # tuples of (name, wanted, have)
+
+                for it in slots.get("items", []):
+                    disp = (it.get("display") or "").strip()
+                    want_qty = int(it.get("qty") or 1)
+                    key = disp.lower()
+
+                    current = index_by_name.get(key)
+                    if not current:
+                        not_in_cart.append(disp or "item")
+                        continue
+
+                    have_qty = int(current.get("qty") or 0)
+                    if want_qty > have_qty:
+                        qty_too_high.append((disp or "item", want_qty, have_qty))
+                        continue
+
+                    try:
+                        oc.remove_from_cart(item_id=it.get("item_id"), qty=want_qty, user_id=user_id)
+                        removed_msgs.append(f"{disp} ×{want_qty}")
+                    except Exception:
+                        qty_too_high.append((disp or "item", want_qty, have_qty))
+
+                parts = []
+                if removed_msgs:
+                    parts.append("Removed: " + ", ".join(removed_msgs) + ".")
+                if not_in_cart:
+                    parts.append("Not in cart: " + ", ".join(not_in_cart) + ".")
+                if qty_too_high:
+                    err_bits = []
+                    for nm, w, h in qty_too_high:
+                        err_bits.append(f"{nm} (you asked {w}, only {h} in cart)")
+                    parts.append("Too many to remove: " + ", ".join(err_bits) + ".")
+
+                if not parts:
+                    parts = ["I couldn’t remove those items. Please check the names and amounts and try again."]
+
+                if response is not None:
+                    response.headers["X-Answer-Source"] = "order:remove_multi"
+                    response.headers["X-Cart-Should-Refresh"] = "1"
+
+                return ChatResp(reply=" ".join(parts) + " Say “show cart” to refresh.")
+            except Exception as e:
+                log.error("remove_multiple failed for user_id=%s: %s", user_id, e)
+                msg = "I couldn’t update your cart."
+                if REQUIRE_AUTH_FOR_ORDER:
+                    msg += " Please make sure you’re signed in and try again."
+                return ChatResp(reply=msg)
 
     # ---- Popularity questions (guarded LLM) ----
     if is_popularity_query(user_msg):

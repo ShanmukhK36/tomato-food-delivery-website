@@ -47,6 +47,7 @@ router.use((req, res, next) => {
       "X-Client-Secret",
       "X-Order-Id",
       "X-Echo-UserId",
+      "X-Last-Order-Status",
     ].join(", ")
   );
 
@@ -76,13 +77,8 @@ async function fetchWithTimeout(url, init, timeoutMs) {
 }
 function shouldRefreshFromAnswerSource(src) {
   if (!src) return false;
-  // any cart-affecting flows should refresh
-  return [
-    "order:add_multi",
-    "order:clear_cart",
-    "order:show_cart",
-    "order:cart_empty",
-  ].includes(src);
+  // refresh on any order mutation or cart reads that imply a UI update
+  return /^(order:(add_|remove_|show_cart|cart_empty))/.test(src);
 }
 // ----- JWT / userId derivation -----
 function getBearerToken(req) {
@@ -183,6 +179,7 @@ router.post("/", express.json({ limit: "10kb" }), async (req, res) => {
     "X-Checkout-Url": upstreamRes.headers.get("x-checkout-url"),
     "X-Client-Secret": upstreamRes.headers.get("x-client-secret"),
     "X-Order-Id": upstreamRes.headers.get("x-order-id"),
+    "X-Last-Order-Status": upstreamRes.headers.get("x-last-order-status"),
   };
   // If upstream forgot to flag refresh but the flow requires it, set it here.
   if (!expose["X-Cart-Should-Refresh"] && shouldRefreshFromAnswerSource(upstreamAnswerSource)) {

@@ -5,27 +5,28 @@ const uid = () => Math.random().toString(36).slice(2, 10);
 const getUserId = () => localStorage.getItem("userId") || "guest";
 const getToken = () => localStorage.getItem("token") || "";
 const keyFor = (userId) => `tomatoai:${userId}:messages`;
+
+// Only refresh for cart-affecting flows (no clear_cart anymore)
 const shouldRefreshCartFrom = (res) => {
   const ans = res.headers.get("X-Answer-Source") || "";
   const refreshFlag = res.headers.get("X-Cart-Should-Refresh") === "1";
-  // Refresh on explicit flag OR typical cart-affecting actions
   return (
     refreshFlag ||
     ans === "order:add_multi" ||
-    ans === "order:clear_cart" ||
+    ans === "order:remove_multi" ||
     ans === "order:show_cart" ||
     ans === "order:cart_empty"
   );
 };
 
 const ChatbotWidget = () => {
-  const { url } = useContext(StoreContext);
+  const { url, addManyToCart, removeManyFromCart } = useContext(StoreContext);
+
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
 
   const [userId, setUserId] = useState(getUserId());
-
   const [messages, setMessages] = useState(() => {
     const u = getUserId();
     const cached = localStorage.getItem(keyFor(u));
@@ -98,6 +99,25 @@ const ChatbotWidget = () => {
     if (open) setTimeout(() => inputRef.current?.focus(), 0);
   }, [open]);
 
+  // Optional: allow other parts (or future AI hints) to batch edit cart directly
+  // Usage example:
+  // window.dispatchEvent(new CustomEvent("chat:addMany", { detail: [{ itemId, qty }, ...] }))
+  // window.dispatchEvent(new CustomEvent("chat:removeMany", { detail: [{ itemId, qty }, ...] }))
+  useEffect(() => {
+    const onAddMany = (e) => {
+      if (Array.isArray(e.detail) && e.detail.length) addManyToCart(e.detail);
+    };
+    const onRemoveMany = (e) => {
+      if (Array.isArray(e.detail) && e.detail.length) removeManyFromCart(e.detail);
+    };
+    window.addEventListener("chat:addMany", onAddMany);
+    window.addEventListener("chat:removeMany", onRemoveMany);
+    return () => {
+      window.removeEventListener("chat:addMany", onAddMany);
+      window.removeEventListener("chat:removeMany", onRemoveMany);
+    };
+  }, [addManyToCart, removeManyFromCart]);
+
   const sendMessage = async (e) => {
     e?.preventDefault();
     const text = input.trim();
@@ -119,29 +139,23 @@ const ChatbotWidget = () => {
 
     const tryFetch = async (attempt = 1) => {
       try {
-        if (!url) {
-          throw new Error("API base URL missing from StoreContext.url");
-        }
+        if (!url) throw new Error("API base URL missing from StoreContext.url");
 
-        // Build headers: send JWT if you have it; cookies go via credentials: 'include'
         const headers = { "Content-Type": "application/json" };
         if (token) {
           headers.Authorization = `Bearer ${token}`;
-          headers["X-User-JWT"] = token; // lets Node forward explicitly as well
+          headers["X-User-JWT"] = token; // node forwards to FastAPI too
         }
 
-        // Client-side debug (one-line, remove if noisy)
-        console.log(
-          "[ChatbotWidget] POST",
-          `${url}/api/chat`,
-          { hasJWT: Boolean(token), userId: currentUserId }
-        );
+        console.log("[ChatbotWidget] POST", `${url}/api/chat`, {
+          hasJWT: Boolean(token),
+          userId: currentUserId,
+        });
 
         const res = await fetch(`${url}/api/chat`, {
           method: "POST",
-          credentials: "include", // ensures browser sends your login cookies
+          credentials: "include",
           headers,
-          // Do NOT send userId in body — backend derives from JWT/cookie
           body: JSON.stringify({ message: text }),
           signal: ac.signal,
         });
@@ -158,23 +172,13 @@ const ChatbotWidget = () => {
         }
 
         if (!res.ok) {
-          const rid =
-            data?.requestId ||
-            res.headers.get("x-request-id") ||
-            "unknown";
+          const rid = data?.requestId || res.headers.get("x-request-id") || "unknown";
           const msg = data?.detail || data?.error || `HTTP ${res.status}`;
           throw new Error(`${msg} · id=${rid}`);
         }
 
-        const reply =
-          typeof data.reply === "string" ? data.reply : "…";
-
-        const botMsg = {
-          id: uid(),
-          role: "assistant",
-          content: reply,
-          ts: Date.now(),
-        };
+        const reply = typeof data.reply === "string" ? data.reply : "…";
+        const botMsg = { id: uid(), role: "assistant", content: reply, ts: Date.now() };
         setMessages((m) => [...m, botMsg]);
       } catch (err) {
         if (ac.signal.aborted) return;
@@ -269,10 +273,7 @@ const ChatbotWidget = () => {
                 >
                   <p className="whitespace-pre-wrap break-words">{m.content}</p>
                   <span className="mt-1 block text-[10px] opacity-70">
-                    {new Date(m.ts).toLocaleTimeString([], {
-                      hour: "2-digit",
-                      minute: "2-digit",
-                    })}
+                    {new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                     {m.error && (
                       <>
                         {" · "}
@@ -290,9 +291,7 @@ const ChatbotWidget = () => {
               </div>
             ))}
             {loading && (
-              <div className="text-xs text-gray-500 italic px-2">
-                TomatoAI is typing…
-              </div>
+              <div className="text-xs text-gray-500 italic px-2">TomatoAI is typing…</div>
             )}
             <div ref={endRef} />
           </div>
