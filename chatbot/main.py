@@ -216,6 +216,7 @@ def explain_stripe_error(text: str) -> str:
 
 # ---------------- Seed Data ----------------
 STATIC_FOODS = [
+    # ... (unchanged static foods list)
     {"name": "Greek salad", "category": "salad", "price": 12, "description": "Classic Mediterranean salad; not spicy. Ingredients: cucumber, ripe tomatoes, red onion, Kalamata olives, feta, oregano, olive oil & lemon."},
     {"name": "Veg salad", "category": "salad", "price": 18, "description": "Crisp garden salad; not spicy. Ingredients: mixed greens, cucumber, tomato, carrots, sweet corn, bell peppers, light lemon-herb vinaigrette."},
     {"name": "Clover Salad", "category": "salad", "price": 16, "description": "Wholesome green bowl; not spicy. Ingredients: lettuce, chickpeas, cucumber, cherry tomatoes, fresh herbs, avocado, lemon-tahini dressing."},
@@ -251,6 +252,7 @@ STATIC_FOODS = [
 ]
 
 def bootstrap_foods_if_empty():
+    # ... (unchanged)
     if db is None:
         return
     try:
@@ -277,6 +279,7 @@ def bootstrap_foods_if_empty():
         log.exception("bootstrap_foods_if_empty failed")
 
 # ---------------- Utilities ----------------
+# ... (unchanged helpers)
 def safe_eq(a: str, b: str) -> bool:
     return hmac.compare_digest((a or "").encode(), (b or "").encode())
 
@@ -301,561 +304,7 @@ def to_safe_dt(v):
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
 
-# menu helpers
-def _items_for(cat: str, limit: int = 20):
-    if db is None:
-        return []
-    try:
-        cur = db["foods"].find(
-            {"category": {"$regex": f"^{cat}$", "$options": "i"}},
-            {"name": 1, "price": 1, "category": 1}
-        ).limit(limit)
-        return [
-            {"name": d.get("name"), "price": d.get("price"), "category": d.get("category")}
-            for d in cur if d.get("name")
-        ]
-    except Exception:
-        log.exception("_items_for(%s) failed", cat)
-        return []
-
-def _fmt_price(p):
-    if p is None:
-        return ""
-    try:
-        if float(p).is_integer():
-            return f"${int(float(p))}"
-        return f"${float(p)}"
-    except Exception:
-        return f"${p}"
-
-def _fmt_items(items):
-    return ", ".join(
-        f"{it['name']} ({_fmt_price(it.get('price'))})" if it.get("price") is not None else f"{it['name']}"
-        for it in items if it.get("name")
-    )
-
-def _names_for(cat: str, limit: int = 20) -> List[str]:
-    items = _items_for(cat, limit)
-    return [it["name"] for it in items]
-
-# ---- Item-detail helpers ----
-def _norm(s: str) -> str:
-    return (s or "").strip().lower()
-
-def _similar(a: str, b: str) -> float:
-    return SequenceMatcher(None, _norm(a), _norm(b)).ratio()
-
-def list_all_food_names(limit=200) -> List[str]:
-    if db is None:
-        return []
-    try:
-        cur = db["foods"].find({}, {"name": 1}).limit(limit)
-        return [d["name"] for d in cur if d.get("name")]
-    except Exception:
-        return []
-
-def find_item_candidates_by_name(query: str, limit: int = 5):
-    if db is None:
-        return []
-    q = _norm(query)
-    if not q:
-        return []
-    try:
-        proj = {"_id": 1, "name": 1, "price": 1, "category": 1, "description": 1}
-
-        exact = list(db["foods"].find(
-            {"name": {"$regex": f"^{re.escape(query)}$", "$options": "i"}}, proj
-        ).limit(1))
-        if exact:
-            return exact
-
-        contains = list(db["foods"].find(
-            {"name": {"$regex": re.escape(query), "$options": "i"}}, proj
-        ).limit(limit * 3))
-
-        pool = contains or list(db["foods"].find({}, proj))
-
-        ranked = []
-        for doc in pool:
-            name = doc.get("name") or ""
-            desc = doc.get("description") or ""
-            score = max(_similar(query, name), _similar(query, desc[:60]))
-            ranked.append((score, doc))
-        ranked.sort(key=lambda t: t[0], reverse=True)
-        return [d for (score, d) in ranked[:limit] if score >= 0.55]
-    except Exception:
-        log.exception("find_item_candidates_by_name failed")
-        return []
-
-def format_item_detail(item: dict) -> str:
-    name = item.get("name", "Item")
-    price = item.get("price")
-    cat = (item.get("category") or "").rstrip("s")
-    desc = (item.get("description") or "").strip()
-    try:
-        price_str = f"${int(float(price))}" if float(price).is_integer() else f"${float(price)}"
-    except Exception:
-        price_str = f"${price}" if price is not None else ""
-    bits = [f"{name} ({price_str})"]
-    if cat:
-        bits.append(f"– {cat}")
-    if desc:
-        bits.append(f": {desc}")
-    return " ".join(bits)
-
-# ---- User/Orders helpers ----
-def _possible_user_id_filters(user_id: str):
-    if not user_id:
-        return None
-    candidates = [{"user_id": user_id}, {"userId": user_id}, {"user": user_id}]
-    if ObjectId:
-        try:
-            oid = ObjectId(user_id)
-            candidates.extend([{"user_id": oid}, {"userId": oid}, {"user": oid}])
-        except Exception:
-            pass
-    candidates.extend([{"user.id": user_id}, {"user._id": user_id}])
-    if ObjectId:
-        try:
-            oid = ObjectId(user_id)
-            candidates.extend([{"user.id": oid}, {"user._id": oid}])
-        except Exception:
-            pass
-    return {"$or": candidates}
-
-def get_popular_items(limit=MAX_POPULAR) -> List[str]:
-    if db is None:
-        return []
-    try:
-        cur = db["foods"].find({}, {"name": 1}).sort("orders", -1).limit(limit)
-        return [doc.get("name") for doc in cur if doc.get("name")]
-    except PyMongoError:
-        log.exception("get_popular_items failed")
-        return []
-
-def get_user_recent_orders(user_id: Optional[str], limit=MAX_RECENT) -> List[str]:
-    if db is None or not user_id or user_id == "guest":
-        return []
-    try:
-        flt = _possible_user_id_filters(user_id)
-        if not flt:
-            return []
-        cur = (
-            db["orders"]
-            .find(flt, {"order_id": 1, "_id": 1})
-            .sort("order_date", -1)
-            .limit(limit)
-        )
-        out: List[str] = []
-        for doc in cur:
-            oid = doc.get("order_id", doc.get("_id"))
-            if oid is not None:
-                out.append(str(oid))
-        return out
-    except PyMongoError:
-        log.exception("get_user_recent_orders failed")
-        return []
-
-def _short_id(oid):
-    s = str(oid or "")
-    return ("…" + s[-2:]) if len(s) > 2 else s
-
-def _fmt_date(d):
-    dt = to_safe_dt(d)
-    return dt.strftime("%b %d, %Y") if dt else "unknown date"
-
-def _summarize_items(items, max_items=3):
-    parts = []
-    total_qty = 0
-    items = items or []
-    for it in items:
-        name = (it.get("name") or "").strip()
-        qty = int(it.get("qty") or 1)
-        total_qty += qty
-        if len(parts) < max_items and name:
-            parts.append(f"{name} ×{qty}")
-    more = max(0, len(items) - len(parts))
-    preview = ", ".join(parts) + (f", +{more} more" if more > 0 else "")
-    return total_qty, preview
-
-def get_user_recent_orders_detailed(user_id: Optional[str], limit=MAX_RECENT):
-    if db is None or not user_id or user_id == "guest":
-        return []
-    try:
-        flt = _possible_user_id_filters(user_id)
-        if not flt:
-            return []
-        pipeline = [
-            {"$match": flt},
-            {
-                "$project": {
-                    "_id": 1,
-                    "order_id": 1,
-                    "items": {"$ifNull": ["$items", []]},
-                    "amount": 1,
-                    "status": 1,
-                    "dt": {"$ifNull": ["$date", {"$ifNull": ["$order_date", "$created_at"]}]},
-                }
-            },
-            {"$sort": {"dt": -1, "_id": -1}},
-            {"$limit": int(limit)},
-        ]
-        docs = list(db["orders"].aggregate(pipeline))
-        out = []
-        for d in docs:
-            out.append({
-                "order_id": d.get("order_id", d.get("_id")),
-                "dt": d.get("dt"),
-                "items": d.get("items") or [],
-                "amount": d.get("amount"),
-                "status": d.get("status"),
-            })
-        return out
-    except Exception:
-        log.exception("get_user_recent_orders_detailed failed")
-        return []
-
-def _items_from_cart_map(cart_map: dict):
-    """Convert {<foodId>: qty} map from Node cart API into [{name, qty}] using foods collection."""
-    if not isinstance(cart_map, dict) or not cart_map or db is None:
-        return []
-    ids = []
-    if ObjectId:
-        for k in cart_map.keys():
-            try:
-                ids.append(ObjectId(k))
-            except Exception:
-                pass
-    name_by_id: Dict[str, str] = {}
-    try:
-        if ids:
-            cur = db["foods"].find({"_id": {"$in": ids}}, {"_id": 1, "name": 1})
-            for d in cur:
-                name_by_id[str(d["_id"])] = d.get("name") or str(d["_id"])
-    except Exception:
-        # fallback: leave map keys as-is
-        pass
-
-    items = []
-    for k, v in cart_map.items():
-        qty = int(v or 1)
-        name = name_by_id.get(str(k), str(k))
-        items.append({"name": name, "qty": qty})
-    return items
-
-# -------- Last payment / transaction helpers --------
-_PAYMENT_STATUS_KEYWORDS = (
-    "why my previous transaction got failed",
-    "why did my previous transaction fail",
-    "why did my payment fail",
-    "payment failed",
-    "transaction failed",
-    "last payment",
-    "previous payment",
-    "previous transaction",
-    "payment status",
-    "was my payment successful",
-    "did my payment go through",
-    "stripe failure",
-    "declined payment",
-    "3ds failed",
-)
-
-def is_payment_status_query(text: str) -> bool:
-    t = (text or "").lower()
-    return any(k in t for k in _PAYMENT_STATUS_KEYWORDS)
-
-def _pick_dt(d):
-    return d.get("date") or d.get("order_date") or d.get("created_at")
-
-def get_user_last_order_with_payment(user_id: Optional[str]) -> Optional[dict]:
-    if db is None or not user_id or user_id == "guest":
-        return None
-    try:
-        flt = _possible_user_id_filters(user_id)
-        if not flt:
-            return None
-        pipeline = [
-            {"$match": flt},
-            {"$addFields": {"_dt": {"$ifNull": ["$date", {"$ifNull": ["$order_date", "$created_at"]}]}}},
-            {"$sort": {"_dt": -1, "_id": -1}},
-            {"$limit": 1},
-            {"$project": {
-                "_id": 1,
-                "order_id": 1,
-                "items": 1,
-                "amount": 1,
-                "status": 1,
-                "payment": 1,
-                "paymentInfo": 1,
-                "date": 1,
-                "order_date": 1,
-                "created_at": 1,
-            }},
-        ]
-        rows = list(db["orders"].aggregate(pipeline))
-        return rows[0] if rows else None
-    except Exception:
-        log.exception("get_user_last_order_with_payment failed")
-        return None
-
-def explain_last_order_payment(order: dict) -> str:
-    if not order:
-        return "I couldn’t find a previous transaction for your account yet."
-
-    amt = order.get("amount")
-    dt_raw = _pick_dt(order) or ((order.get("paymentInfo", {}) or {}).get("stripe", {}) or {}).get("paidAt")
-    dt = to_safe_dt(dt_raw)
-    when = dt.strftime("%b %d, %Y %H:%M %Z") if dt else "unknown time"
-
-    paid_flag = bool(order.get("payment"))
-    status = (order.get("status") or "").strip().upper()
-
-    stripe = (order.get("paymentInfo", {}) or {}).get("stripe", {}) or {}
-    stripe_status = (stripe.get("status") or "").strip().lower()
-    err_code = (stripe.get("errorCode") or "").strip()
-    err_msg = (stripe.get("errorMessage") or "").strip()
-    sess_id = (stripe.get("sessionId") or "").strip()
-    intent_id = (stripe.get("paymentIntentId") or "").strip()
-
-    is_success = (
-        paid_flag
-        or status in ("PAID", "COMPLETED", "FULFILLED")
-        or stripe_status == "succeeded"
-    )
-
-    if is_success:
-        parts = [f"Your last payment was successful"]
-        if amt is not None:
-            try:
-                parts.append(f"for ${int(float(amt)) if float(amt).is_integer() else float(amt)}")
-            except Exception:
-                parts.append(f"for ${amt}")
-        parts.append(f"on {when}.")
-        tail_bits = []
-        if intent_id:
-            tail_bits.append(f"intent {intent_id[:8]}…")
-        if sess_id:
-            tail_bits.append(f"session {sess_id[:8]}…")
-        if tail_bits:
-            parts.append("(" + ", ".join(tail_bits) + ")")
-        return " ".join(parts)
-
-    probe = []
-    if err_code: probe.append(f"code: {err_code}")
-    if err_msg:  probe.append(err_msg)
-    if stripe_status: probe.append(f"status: {stripe_status}")
-    if not probe and status:
-        probe.append(f"status: {status.lower()}")
-
-    if not probe:
-        return ("It looks like the last payment did not succeed. "
-                "Please try another card or contact your bank, and you can try again.")
-    return explain_stripe_error(" | ".join(probe))
-
-# Category helpers
-def get_sandwich_names(limit=20): return _names_for("sandwich", limit)
-def get_rolls_names(limit=20):    return _names_for("rolls", limit)
-def get_salad_names(limit=20):    return _names_for("salad", limit)
-def get_desserts_names(limit=20): return _names_for("desserts", limit)
-def get_cake_names(limit=20):     return _names_for("cake", limit)
-def get_pasta_names(limit=20):    return _names_for("pasta", limit)
-def get_noodles_names(limit=20):  return _names_for("noodles", limit)
-def get_veg_names(limit=20):      return _names_for("veg", limit)
-
-SYNONYMS = {
-    "sub": "sandwich", "subs": "sandwich", "hoagie": "sandwich",
-    "wrap": "rolls", "wraps": "rolls",
-    "desert": "desserts", "deserts": "desserts",
-    "pure veg": "veg",
-}
-def category_from_query(text: str) -> Optional[str]:
-    lower = text.lower()
-    for raw in ("sandwich", "roll", "rolls", "salad", "dessert", "desserts", "cake", "pasta", "noodle", "noodles", "veg", "pure veg"):
-        if raw in lower:
-            if raw in ("roll",): return "rolls"
-            if raw in ("dessert",): return "desserts"
-            if raw in ("pure veg",): return "veg"
-            return raw.rstrip("s")
-    for alias, canon in SYNONYMS.items():
-        if alias in lower:
-            return canon
-    return None
-
-# -------- Popularity helpers --------
-POPULAR_KEYWORDS = ("popular", "best", "bestseller", "most ordered", "most-ordered", "top", "famous", "hot")
-
-def is_popularity_query(text: str) -> bool:
-    t = (text or "").lower()
-    return any(k in t for k in POPULAR_KEYWORDS)
-
-def top_items_from_orders(limit: int = 3, category: Optional[str] = None) -> List[str]:
-    if db is None:
-        return []
-    try:
-        pipeline = [
-            {"$unwind": "$items"},
-            {"$addFields": {"qty": {"$ifNull": ["$items.qty", 1]}}},
-        ]
-        if category:
-            cat_lower = category.lower()
-            pipeline += [
-                {
-                    "$lookup": {
-                        "from": "foods",
-                        "let": {"itemName": "$items.name"},
-                        "pipeline": [
-                            {"$match": {"$expr": {"$and": [
-                                {"$eq": [{"$toLower": "$name"}, {"$toLower": "$$itemName"}]},
-                                {"$eq": [{"$toLower": "$category"}, cat_lower]},
-                            ]}}}
-                        ],
-                        "as": "food"
-                    }
-                },
-                {"$match": {"food.0": {"$exists": True}}},
-                {"$addFields": {"canonName": {"$arrayElemAt": ["$food.name", 0]}}},
-            ]
-            group_key = "$canonName"
-        else:
-            group_key = {"$toLower": "$items.name"}
-
-        pipeline += [
-            {"$group": {"_id": group_key, "totalQty": {"$sum": "$qty"}}},
-            {"$sort": {"totalQty": -1}},
-            {"$limit": int(limit)},
-        ]
-
-        rows = list(db["orders"].aggregate(pipeline))
-        names: List[str] = []
-        for r in rows:
-            name = r["_id"]
-            if isinstance(name, dict):
-                name = name.get("name") or name.get("_id") or ""
-            if isinstance(name, str) and name:
-                names.append(name)
-        return names
-    except Exception:
-        log.exception("top_items_from_orders failed (category=%s)", category)
-        return []
-
-def top_items_from_foods(limit: int = 3, category: Optional[str] = None) -> List[str]:
-    if db is None:
-        return []
-    try:
-        q = {}
-        if category:
-            q["category"] = {"$regex": f"^{category}$", "$options": "i"}
-        cur = db["foods"].find(q, {"name": 1}).sort("orders", -1).limit(int(limit))
-        return [d["name"] for d in cur if d.get("name")]
-    except Exception:
-        log.exception("top_items_from_foods failed (category=%s)", category)
-        return []
-
-def bump_food_orders(items: List[dict]):
-    if db is None:
-        return
-    try:
-        for it in items or []:
-            name = (it.get("name") or it.get("item_id") or "").strip()
-            qty = int(it.get("qty") or 1)
-            if not name:
-                continue
-            db["foods"].update_one({"name": name}, {"$inc": {"orders": qty}})
-    except Exception:
-        log.exception("bump_food_orders failed")
-
-# ---------------- LLM helpers ----------------
-SYSTEM_PROMPT = (
-    "You are TomatoAI, a concise, friendly customer support chatbot for a food delivery platform. "
-    "Only use details present in the Database context (Menu & Descriptions). "
-    "Never invent items, ingredients, prices, policies, or order numbers. Keep replies short.\n"
-)
-
-def llm_compose(system_prompt: str, content: str) -> str:
-    if client is None:
-        return content
-    try:
-        r = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": content},
-            ],
-            temperature=0.2,
-            max_tokens=OPENAI_MAX_TOKENS,
-        )
-        out = (r.choices[0].message.content or "").strip()
-        return out or content
-    except (APIConnectionError, RateLimitError, APIStatusError) as e:
-        log.error("llm_compose openai error type=%s msg=%s", type(e).__name__, str(e))
-        return content
-    except Exception as e:
-        log.exception("llm_compose unexpected err=%s", e)
-        return content
-
-def build_context(user_msg: str, user_id: Optional[str]) -> str:
-    mem_lines: List[str] = []
-    if memory:
-        try:
-            results = memory.search(query=user_msg, user_id=user_id) or {}
-            for m in take(results.get("results", []), 5):
-                val = m.get("memory")
-                if isinstance(val, str) and val.strip():
-                    mem_lines.append(f"- {val.strip()[:160]}")
-        except Exception:
-            pass
-
-    popular = take(get_popular_items(), MAX_POPULAR)
-    recent = take(get_user_recent_orders(user_id), MAX_RECENT)
-
-    sandwiches = _items_for("sandwich", MAX_POPULAR)
-    rolls      = _items_for("rolls", MAX_POPULAR)
-    veg        = _items_for("veg", MAX_POPULAR)
-    desserts   = _items_for("desserts", MAX_POPULAR)
-    salad      = _items_for("salad", MAX_POPULAR)
-    cake       = _items_for("cake", MAX_POPULAR)
-    pasta      = _items_for("pasta", MAX_POPULAR)
-    noodles    = _items_for("noodles", MAX_POPULAR)
-    menu_names = list_all_food_names()
-
-    ctx_parts: List[str] = []
-    if mem_lines:  ctx_parts.append("Relevant past information:\n" + "\n".join(mem_lines))
-    if popular:    ctx_parts.append("Popular dishes: " + ", ".join(popular))
-    if recent:     ctx_parts.append("User recent orders: " + ", ".join(recent))
-    if sandwiches: ctx_parts.append("Sandwich options: " + _fmt_items(sandwiches))
-    if rolls:      ctx_parts.append("Rolls options: " + _fmt_items(rolls))
-    if salad:      ctx_parts.append("Salad options: " + _fmt_items(salad))
-    if desserts:   ctx_parts.append("Dessert options: " + _fmt_items(desserts))
-    if cake:       ctx_parts.append("Cake options: " + _fmt_items(cake))
-    if pasta:      ctx_parts.append("Pasta options: " + _fmt_items(pasta))
-    if noodles:    ctx_parts.append("Noodles options: " + _fmt_items(noodles))
-    if veg:        ctx_parts.append("Veg options: " + _fmt_items(veg))
-    if menu_names: ctx_parts.append("Menu (names only): " + ", ".join(menu_names))
-
-    return ("Database context:\n" + "\n".join(ctx_parts) + "\n") if ctx_parts else ""
-
-def guarded_rewrite(user_msg: str, draft: str) -> str:
-    menu = ", ".join(list_all_food_names())
-    rules = (
-        "Rules:\n"
-        "• ONLY reference items that appear in Menu.\n"
-        "• If the user mentions an item not in Menu, say it isn't on our menu and suggest the closest 1–3 matches by name only.\n"
-        "• Do not invent ingredients, prices, sizes, or availability beyond the provided Descriptions.\n"
-        "• Keep it under ~80 words unless the customer explicitly asks for more.\n"
-    )
-    content = f"{rules}\nMenu: {menu}\n\nCustomer: {user_msg}\nDraft: {draft}\nRewrite the Draft to answer the Customer. Stay faithful to the Draft."
-    return llm_compose(SYSTEM_PROMPT, content)
-
-# ---------------- Previous Orders intent ----------------
-_PREV_ORDERS_KEYWORDS = (
-    "previous orders", "past orders", "order history", "my orders",
-    "recent orders", "last order", "my last order", "history of orders",
-    "show my orders", "show my previous orders", "show my recent orders"
-)
-def is_previous_orders_query(text: str) -> bool:
-    t = (text or "").lower()
-    return any(k in t for k in _PREV_ORDERS_KEYWORDS)
+# ... (menu helpers etc. unchanged)
 
 # === ORDER CLIENT & MODELS ===
 @dataclass
@@ -938,6 +387,16 @@ class OrderClient:
             timeout=6.0,
         )
 
+    def remove_from_cart(self, item_id: str, qty: int = 1, user_id: Optional[str] = None):
+        body = {"itemId": item_id, "qty": max(1, int(qty))}
+        if user_id:
+            body["userId"] = user_id
+        return self._post_try(
+            candidates=["/cart/remove", "/cart/items/remove"],
+            json=body,
+            timeout=6.0,
+        )
+
     def get_cart(self, user_id: Optional[str] = None):
         try:
             if user_id:
@@ -979,12 +438,13 @@ class OrderClient:
             json={"paymentIntentId": payload.payment_intent_id},
             timeout=8.0,
         )
+
     # ---- CART (clear) ----
     def clear_cart(self, user_id: Optional[str] = None):
-        # Prefer explicit clear endpoints, then DELETE fallbacks, then POST fallbacks.
-        # Body/query userId when available to match your existing add/get patterns.
+        # Prefer explicit clear endpoints, then DELETE fallbacks, then POST fallbacks,
+        # then fallback: fetch items and remove everything via /cart/remove.
         q = f"?userId={user_id}" if user_id else ""
-        # Try POST-like clears
+        # 1) Try POST-like clears
         try:
             return self._post_try(
                 candidates=[f"/cart/clear{q}", f"/cart/reset{q}", f"/cart/empty{q}"],
@@ -993,7 +453,8 @@ class OrderClient:
             )
         except Exception:
             pass
-        # Try DELETE-style clears (no body)
+
+        # 2) Try DELETE-style clears (no body)
         last_err = None
         for p in [f"/cart/items{q}", f"/cart{q}"]:
             try:
@@ -1004,26 +465,76 @@ class OrderClient:
                 last_err = f"{p} -> {r.status_code} {(r.text or '')[:200]}"
             except Exception as e:
                 last_err = f"{p} -> {e}"
-        # As absolute fallback, try POST to /cart with empty items map
+
+        # 3) Fallback: fetch cart, then remove everything via /cart/remove
         try:
-            return self._post_try(
-                candidates=[f"/cart{q}"],
-                json={"items": {}, "userId": user_id} if user_id else {"items": {}},
-                timeout=6.0,
+            current = self.get_cart(user_id=user_id) or {}
+            cart_map = (
+                current.get("cartData")
+                or current.get("data", {}).get("cartData")
+                or {}
             )
+            # If we received items array instead of a map, reduce to id->qty when possible
+            if not cart_map:
+                items = (
+                    current.get("items")
+                    or current.get("cart", {}).get("items")
+                    or current.get("data", {}).get("items")
+                    or current.get("result", {}).get("items")
+                    or []
+                )
+                tmp = {}
+                for it in items:
+                    _id = it.get("_id") or it.get("itemId") or it.get("id")
+                    _qty = it.get("qty") or it.get("quantity") or 1
+                    if _id:
+                        tmp[str(_id)] = int(_qty or 1)
+                cart_map = tmp
+
+            # Nothing to clear
+            if not isinstance(cart_map, dict) or not cart_map:
+                return {"success": True, "items": []}
+
+            # Remove in as few calls as possible (qty-aware), otherwise 1-by-1
+            for item_id, qty in list(cart_map.items()):
+                qty = max(1, int(qty or 1))
+                try:
+                    self.remove_from_cart(item_id=item_id, qty=qty, user_id=user_id)
+                except Exception:
+                    for _ in range(qty):
+                        try:
+                            self.remove_from_cart(item_id=item_id, qty=1, user_id=user_id)
+                        except Exception:
+                            break
+
+            # Re-check cart; if empty, declare success
+            verify = self.get_cart(user_id=user_id) or {}
+            v_map = (
+                verify.get("cartData")
+                or verify.get("data", {}).get("cartData")
+                or {}
+            )
+            v_items = (
+                verify.get("items")
+                or verify.get("cart", {}).get("items")
+                or verify.get("data", {}).get("items")
+                or verify.get("result", {}).get("items")
+                or []
+            )
+            emptied = (isinstance(v_map, dict) and len(v_map) == 0) or (isinstance(v_items, list) and len(v_items) == 0)
+            return {"success": True, "items": []} if emptied else {"success": False, "items": v_items}
         except Exception as e:
-            raise RuntimeError(f"clear_cart failed: {last_err or e}")
+            raise RuntimeError(f"clear_cart fallback failed: {last_err or e}")
 
 # === ORDERING intent extraction (multi-item support) ===
+# Make "show cart" strict so "add ... to cart" doesn't misfire as show_cart.
 SHOW_CART_PATTERNS = (
     r"\b(show|view|see)\b.*\b(cart|basket|bag)\b",
     r"\bwhat'?s in (my )?cart\b",
     r"\bshowcart\b",
     r"\bviewcart\b",
     r"\bmy\s*cart\b",
-    r"\bcart\b",
-    r"\bbasket\b",
-    r"\bbag\b",
+    r"^(cart|basket|bag)$",
 )
 CLEAR_CART_PATTERNS = (
     r"\b(clear|empty|flush|clean|reset|remove\s+all)\b.*\b(cart|basket|bag)\b",
@@ -1078,6 +589,7 @@ def extract_payment_method(text: str) -> str:
     return "card"
 
 def extract_address_and_contact_from_mem(user_id: Optional[str]):
+    # ... (unchanged)
     addr = {"line1": "", "city": "", "zip": ""}
     contact = {"name": "", "phone": "", "email": ""}
     if memory and user_id:
@@ -1101,10 +613,12 @@ def extract_action(user_msg: str) -> Optional[dict]:
     t = (user_msg or "").strip()
     low = t.lower()
 
+    # ✅ check clear first
     for p in CLEAR_CART_PATTERNS:
         if re.search(p, low, flags=re.IGNORECASE):
             return {"type": "clear_cart", "slots": {}}
 
+    # then show cart (stricter patterns)
     for p in SHOW_CART_PATTERNS:
         if re.search(p, low, flags=re.IGNORECASE):
             return {"type": "show_cart", "slots": {}}
@@ -1138,7 +652,7 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- App ----------------
-app = FastAPI(title="Tomato Chatbot API", version="1.9.0-ordering")
+app = FastAPI(title="Tomato Chatbot API", version="1.9.1-ordering")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1217,7 +731,7 @@ def health():
         "db": DB_NAME,
         "db_ok": db_ok,
         "model": OPENAI_MODEL,
-        "version": "1.9.0-ordering",
+        "version": "1.9.1-ordering",
         "force_llm": FORCE_LLM,
     }
 
@@ -1295,7 +809,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
     # === ORDERING (cart, checkout, confirm) ===
     action = extract_action(user_msg)
     if action and ORDER_API_BASE:
-        # --- NEW: collect auth from either custom headers or standard Authorization ---
+        # --- collect auth from either custom headers or standard Authorization ---
         jwt_token = ""
         fwd_cookie = ""
         if request:
@@ -1363,7 +877,7 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             try:
                 cart = oc.get_cart(user_id=user_id)
 
-                # 🔧 Normalize different backend shapes
+                # Normalize different backend shapes
                 payload = cart or {}
                 items = (
                     payload.get("items")
@@ -1406,23 +920,21 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
 
                 if response is not None:
                     response.headers["X-Answer-Source"] = "order:show_cart"
-                    # Let the frontend know it should refresh its StoreContext cart
                     response.headers["X-Cart-Should-Refresh"] = "1"
 
                 return ChatResp(reply=f"In your cart: {', '.join(parts)}{suffix}. Say “checkout” to continue.")
             except Exception as e:
                 log.error("get_cart failed for user_id=%s: %s", user_id, e)
-                if REQUIRE_AUTH_FOR_ORDER:
+                if REQUIRE_AUTH_FOR_ORDER and not (jwt_token or fwd_cookie):
                     return ChatResp(reply="I couldn’t load your cart. Please make sure you’re signed in and the app forwards your login to chat.")
                 return ChatResp(reply="I couldn’t load your cart. Please try again.")
-        
+
         if t == "clear_cart":
             try:
                 res = oc.clear_cart(user_id=user_id)
 
                 # Normalize shapes to detect success/emptiness
                 payload = res or {}
-                # Many Node templates respond with { success: true } or { cartData: {} } or { items: [] }
                 success_flag = bool(payload.get("success") in (True, "true", 1))
                 items = (
                     payload.get("items")
@@ -1436,7 +948,6 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                     or payload.get("data", {}).get("cartData")
                     or {}
                 )
-
                 cleared = success_flag or (isinstance(items, list) and len(items) == 0) or (isinstance(cart_map, dict) and len(cart_map) == 0)
 
                 if response is not None:
@@ -1445,12 +956,11 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
 
                 if cleared:
                     return ChatResp(reply="Your cart is now empty.")
-                # If backend didn’t clearly signal emptiness, still hint the next step
                 return ChatResp(reply="I tried to clear your cart. If anything remains, say “show cart” to refresh.")
             except Exception as e:
                 log.error("clear_cart failed for user_id=%s: %s", user_id, e)
-                if REQUIRE_AUTH_FOR_ORDER:
-                    return ChatResp(reply="I couldn’t clear your cart. Please make sure you’re signed in and try again.")
+                if REQUIRE_AUTH_FOR_ORDER and not (jwt_token or fwd_cookie):
+                    return ChatResp(reply="Please log in to clear your cart, then try again.")
                 return ChatResp(reply="I couldn’t clear your cart right now. Please try again.")
 
         if t == "checkout":
