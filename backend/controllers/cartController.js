@@ -2,24 +2,21 @@ import userModel from '../models/userModel.js';
 
 // add items to user cart
 const addToCart = async (req, res) => {
-  try {
-    const qty = Number(req.body.quantity) || 1; // default = 1
-    const userData = await userModel.findById(req.body.userId);
-    const cartData = userData.cartData || {};
-
-    if (!cartData[req.body.itemId]) {
-      cartData[req.body.itemId] = qty;
-    } else {
-      cartData[req.body.itemId] += qty;
+    try {
+        let userData = await userModel.findById(req.body.userId);
+        let cartData = await userData.cartData;
+        if(!cartData[req.body.itemId]) {
+            cartData[req.body.itemId] = 1;
+        } else {
+            cartData[req.body.itemId] += 1;
+        }
+        await userModel.findByIdAndUpdate(req.body.userId, {cartData});
+        res.json({success: true, message: 'Added To Cart'});
+    } catch(error) {
+        console.log(error);
+        return res.json({success: false, message: error.message});
     }
-
-    await userModel.findByIdAndUpdate(req.body.userId, { cartData });
-    res.json({ success: true, message: `Added ${qty} item(s) to cart` });
-  } catch (error) {
-    console.error(error);
-    res.json({ success: false, message: error.message });
-  }
-};
+}
 
 // remove items from user cart
 const removeFromCart = async (req, res) => {
@@ -58,20 +55,23 @@ const getCart = async (req, res) => {
 // add multiple items [{itemId, qty}] with per-item status
 const addManyToCart = async (req, res) => {
   try {
-    const { userId, itemId, quantity } = req.body;
-    const userData = await userModel.findById(userId);
-    const cartData = userData.cartData || {};
+    const { userId, itemId, quantity, items } = req.body;
 
-    for (let i = 0; i < quantity; i++) {
-      if (!cartData[itemId]) {
-        cartData[itemId] = 1;
-      } else {
-        cartData[itemId] += 1;
+    if (Array.isArray(items) && items.length > 0) {
+      // multiple items [{itemId, qty}]
+      for (const { itemId, qty } of items) {
+        for (let i = 0; i < (Number(qty) || 1); i++) {
+          await addToCart({ body: { userId, itemId } }, { json: () => {} });
+        }
+      }
+    } else {
+      // single item with quantity
+      for (let i = 0; i < (Number(quantity) || 1); i++) {
+        await addToCart({ body: { userId, itemId } }, { json: () => {} });
       }
     }
 
-    await userModel.findByIdAndUpdate(userId, { cartData });
-    res.json({ success: true, message: `Added ${quantity} item(s) to cart` });
+    res.json({ success: true, message: "Added multiple items to cart" });
   } catch (error) {
     console.error(error);
     res.json({ success: false, message: error.message });
@@ -81,17 +81,21 @@ const addManyToCart = async (req, res) => {
 // remove multiple items [{itemId, qty}] with per-item status
 const removeManyFromCart = async (req, res) => {
   try {
-    const user = await userModel.findById(req.body.userId);
-    const cartData = { ...(user.cartData || {}) };
+    const { userId, itemId, quantity, items } = req.body;
 
-    for (const { itemId, qty } of (req.body.items || [])) {
-      const n = Math.max(0, (cartData[itemId] || 0) - (Number(qty) || 1));
-      if (n <= 0) delete cartData[itemId];
-      else cartData[itemId] = n;
+    if (Array.isArray(items) && items.length > 0) {
+      for (const { itemId, qty } of items) {
+        for (let i = 0; i < (Number(qty) || 1); i++) {
+          await removeFromCart({ body: { userId, itemId } }, { json: () => {} });
+        }
+      }
+    } else {
+      for (let i = 0; i < (Number(quantity) || 1); i++) {
+        await removeFromCart({ body: { userId, itemId } }, { json: () => {} });
+      }
     }
 
-    await userModel.findByIdAndUpdate(req.body.userId, { cartData });
-    res.json({ success: true, message: "Removed multiple items", cartData });
+    res.json({ success: true, message: "Removed multiple items from cart" });
   } catch (error) {
     console.error(error);
     res.json({ success: false, message: error.message });
