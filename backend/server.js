@@ -81,6 +81,7 @@ app.use((req, res, next) => {
       'X-Order-Id',
       'X-Echo-UserId',
       'X-Cart-Should-Refresh',
+      'X-Last-Order-Status',
     ].join(', ')
   );
   if (req.method === 'OPTIONS') return res.status(204).end();
