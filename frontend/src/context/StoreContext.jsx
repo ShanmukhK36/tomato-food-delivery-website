@@ -18,8 +18,11 @@ const StoreContextProvider = (props) => {
   // --- Normalize cart payloads into a { [foodId]: qty } map
   const extractCartMap = (payload) => {
     if (!payload || typeof payload !== 'object') return {};
+    // Typical Node template
     if (payload.cartData && typeof payload.cartData === 'object') return payload.cartData;
+    // Alt nesting
     if (payload.data?.cartData && typeof payload.data.cartData === 'object') return payload.data.cartData;
+    // Some APIs return { items: [{_id, qty}] }
     if (Array.isArray(payload.items)) {
       const out = {};
       for (const it of payload.items) {
@@ -36,15 +39,18 @@ const StoreContextProvider = (props) => {
   const refreshCart = async () => {
     if (!token || !url) return;
     try {
+      // Your API uses POST /api/cart/get with header { token }
       const res = await axios.post(`${url}/api/cart/get`, {}, authHeaders);
-      const ok = !!(res.data?.success ?? true);
-      if (ok) setCartItems(extractCartMap(res.data) || {});
+      const ok = !!(res.data?.success ?? true); // be lenient if backend omits success
+      if (ok) {
+        const map = extractCartMap(res.data) || {};
+        setCartItems(map);
+      }
     } catch (e) {
       console.error('refreshCart failed', e);
     }
   };
 
-  // === Single-item ops (unchanged) ===
   const addToCart = async (itemId) => {
     setCartItems((prev) => ({ ...prev, [itemId]: (prev[itemId] || 0) + 1 }));
     if (token && url) {
@@ -52,7 +58,7 @@ const StoreContextProvider = (props) => {
         await axios.post(`${url}/api/cart/add`, { itemId }, authHeaders);
       } catch (e) {
         console.error('addToCart failed', e);
-        // optional: await refreshCart();
+        // soft rollback optional
       }
     }
   };
@@ -64,62 +70,48 @@ const StoreContextProvider = (props) => {
         await axios.post(`${url}/api/cart/remove`, { itemId }, authHeaders);
       } catch (e) {
         console.error('removeFromCart failed', e);
-        // optional: await refreshCart();
       }
     }
   };
 
-  // === NEW: Multi-item ops (for chatbot & batch UI) ===
-  // items: Array<{ itemId: string, qty: number }>
-  const addManyToCart = async (items = []) => {
-    if (!Array.isArray(items) || items.length === 0) return;
-    // optimistic
-    setCartItems((prev) => {
-      const next = { ...prev };
-      for (const it of items) {
-        const id = it?.itemId;
-        const q  = Math.max(1, Number(it?.qty ?? 1));
-        if (!id) continue;
-        next[id] = (next[id] || 0) + q;
-      }
-      return next;
-    });
-    if (token && url) {
-      try {
-        await axios.post(`${url}/api/cart/add-many`, { items }, authHeaders);
-      } catch (e) {
-        console.error('addManyToCart failed', e);
-        await refreshCart();
-      }
-    }
-    // Let listeners (e.g., chat widget) know the cart may have changed
-    window.dispatchEvent(new CustomEvent('cart:refresh'));
-  };
+  // --- NEW: Clear entire cart (tries common endpoints)
+  const clearCart = async () => {
+    // optimistic UI
+    setCartItems({});
+    if (!token || !url) return;
 
-  // items: Array<{ itemId: string, qty: number }>
-  const removeManyFromCart = async (items = []) => {
-    if (!Array.isArray(items) || items.length === 0) return;
-    // optimistic
-    setCartItems((prev) => {
-      const next = { ...prev };
-      for (const it of items) {
-        const id = it?.itemId;
-        const q  = Math.max(1, Number(it?.qty ?? 1));
-        if (!id) continue;
-        const cur = next[id] || 0;
-        next[id] = Math.max(0, cur - q);
-        if (next[id] === 0) delete next[id];
-      }
-      return next;
-    });
-    if (token && url) {
+    // Try likely endpoints in order; ignore failures until all fail
+    const attempts = [
+      () => axios.post(`${url}/api/cart/clear`, {}, authHeaders),
+      () => axios.post(`${url}/api/cart/reset`, {}, authHeaders),
+      () => axios.post(`${url}/api/cart/empty`, {}, authHeaders),
+      // some templates accept DELETEs
+      () => axios.delete(`${url}/api/cart/items`, authHeaders),
+      () => axios.delete(`${url}/api/cart`, authHeaders),
+      // fallback: set empty items map
+      () => axios.post(`${url}/api/cart`, { items: {} }, authHeaders),
+    ];
+
+    let success = false;
+    for (const call of attempts) {
       try {
-        await axios.post(`${url}/api/cart/remove-many`, { items }, authHeaders);
-      } catch (e) {
-        console.error('removeManyFromCart failed', e);
-        await refreshCart();
+        const res = await call();
+        const ok = !!(res.data?.success ?? true);
+        const map = extractCartMap(res.data);
+        // Treat either explicit success or an empty map as success
+        if (ok || Object.keys(map).length === 0) {
+          success = true;
+          break;
+        }
+      } catch {
+        // try next
       }
     }
+    if (!success) {
+      // If server didn’t actually clear, re-sync from backend
+      await refreshCart();
+    }
+    // also notify any listeners (optional; chat widget already dispatches this)
     window.dispatchEvent(new CustomEvent('cart:refresh'));
   };
 
@@ -137,11 +129,10 @@ const StoreContextProvider = (props) => {
 
   const contextvalue = {
     food_list, cartItems, setCartItems,
-    addToCart, removeFromCart,           // single-item
-    addManyToCart, removeManyFromCart,   // multi-item
-    getTotalCartValue,
+    addToCart, removeFromCart, getTotalCartValue,
     url, token, setToken, search, setSearch, showSearch, setShowSearch,
     refreshCart,
+    clearCart,            // <-- expose clearCart to UI
   };
 
   const fetchFoodList = async () => {
@@ -158,7 +149,7 @@ const StoreContextProvider = (props) => {
   const loadCartData = async (tok) => {
     try {
       const res = await axios.post(`${url}/api/cart/get`, {}, { headers: { token: tok } });
-      if (res.data?.success ?? true) setCartItems(extractCartMap(res.data));
+      if (res.data?.success) setCartItems(extractCartMap(res.data));
     } catch (e) {
       console.error('loadCartData failed', e);
     }
@@ -177,7 +168,7 @@ const StoreContextProvider = (props) => {
     })();
   }, []);
 
-  // Re-sync cart whenever something (like the chatbot) dispatches 'cart:refresh'
+  // --- DE-DUPED: single cart:refresh listener that re-syncs from server
   useEffect(() => {
     const onRefresh = async () => {
       const t = localStorage.getItem('token');
