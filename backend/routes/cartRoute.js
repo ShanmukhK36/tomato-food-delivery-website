@@ -7,7 +7,7 @@ const cartRouter = express.Router();
 cartRouter.post('/add', authMiddleware, addToCart);
 cartRouter.post('/remove', authMiddleware, removeFromCart);
 cartRouter.post('/get', authMiddleware, getCart);
-router.post("/cart/add-many", authMiddleware, addManyToCart);
-router.post("/cart/remove-many", authMiddleware, removeManyFromCart);
+cartRouter.post("/cart/add-many", authMiddleware, addManyToCart);
+cartRouter.post("/cart/remove-many", authMiddleware, removeManyFromCart);
 
 export default cartRouter;
