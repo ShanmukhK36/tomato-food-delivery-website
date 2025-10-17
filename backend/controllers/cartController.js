@@ -55,41 +55,23 @@ const getCart = async (req, res) => {
 // add multiple items [{itemId, qty}] with per-item status
 const addManyToCart = async (req, res) => {
   try {
-    const userId = req.body?.userId;
-    const items = Array.isArray(req.body?.items) ? req.body.items : [];
-    if (!userId) return res.json({ success: false, message: "userId required" });
-    if (!items.length) return res.json({ success: false, message: "items array required" });
+    const { userId, itemId, quantity } = req.body;
+    const userData = await userModel.findById(userId);
+    const cartData = userData.cartData || {};
 
-    const user = await userModel.findById(userId);
-    if (!user) return res.json({ success: false, message: "user not found" });
-
-    const cart = (user.cartData && typeof user.cartData === "object") ? user.cartData : {};
-
-    const results = items.map((it) => {
-      const itemId = it?.itemId;
-      const rawQty = it?.qty ?? 1;
-      const qty = Number.isFinite(Number(rawQty)) && Number(rawQty) > 0 ? Math.floor(Number(rawQty)) : 1;
-
-      if (!itemId) {
-        return { itemId: null, ok: false, code: "missing_itemId", message: "itemId required" };
+    for (let i = 0; i < quantity; i++) {
+      if (!cartData[itemId]) {
+        cartData[itemId] = 1;
+      } else {
+        cartData[itemId] += 1;
       }
-      const current = Number(cart[itemId] || 0);
-      cart[itemId] = current + qty;
+    }
 
-      return { itemId, ok: true, added: qty, newQty: cart[itemId] };
-    });
-
-    await userModel.findByIdAndUpdate(userId, { cartData: cart });
-
-    return res.json({
-      success: true,
-      message: "Added items",
-      results,
-      cartData: cart,
-    });
+    await userModel.findByIdAndUpdate(userId, { cartData });
+    res.json({ success: true, message: `Added ${quantity} item(s) to cart` });
   } catch (error) {
-    console.log(error);
-    return res.json({ success: false, message: error.message });
+    console.error(error);
+    res.json({ success: false, message: error.message });
   }
 };
 
