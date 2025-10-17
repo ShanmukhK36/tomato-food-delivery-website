@@ -1101,13 +1101,13 @@ def extract_action(user_msg: str) -> Optional[dict]:
     t = (user_msg or "").strip()
     low = t.lower()
 
-    for p in SHOW_CART_PATTERNS:
-        if re.search(p, low, flags=re.IGNORECASE):
-            return {"type": "show_cart", "slots": {}}
-    
     for p in CLEAR_CART_PATTERNS:
         if re.search(p, low, flags=re.IGNORECASE):
             return {"type": "clear_cart", "slots": {}}
+
+    for p in SHOW_CART_PATTERNS:
+        if re.search(p, low, flags=re.IGNORECASE):
+            return {"type": "show_cart", "slots": {}}
 
     if any(re.search(p, low) for p in CHECKOUT_PATTERNS):
         return {"type": "checkout", "slots": {"payment_method": extract_payment_method(low)}}
