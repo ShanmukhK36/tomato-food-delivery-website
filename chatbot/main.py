@@ -595,6 +595,33 @@ def is_affirmative(text: str) -> bool:
     t = text or ""
     return any(re.search(p, t, flags=re.IGNORECASE) for p in AFFIRMATIVE_PATTERNS)
 
+def default_starter_item_id() -> Optional[str]:
+    """
+    Prefer exact 'Veg Noodles' (as in your suggestion). Fallbacks:
+    - best match on 'Veg Noodles'
+    - a noodles category item
+    - a top/popular item
+    Returns the foods._id as a string if found.
+    """
+    # Exact name first
+    cands = find_item_candidates_by_name("Veg Noodles", limit=1)
+    if cands:
+        return str(cands[0].get("_id") or "")
+    # Any noodles option
+    noodles = _items_for("noodles", limit=1)
+    if noodles:
+        # map name back to id
+        by_name = find_item_candidates_by_name(noodles[0]["name"], limit=1)
+        if by_name:
+            return str(by_name[0].get("_id") or "")
+    # Popular fallback
+    popular_names = top_items_from_foods(limit=1) or top_items_from_orders(limit=1)
+    if popular_names:
+        by_name = find_item_candidates_by_name(popular_names[0], limit=1)
+        if by_name:
+            return str(by_name[0].get("_id") or "")
+    return None
+
 # -------- Last payment / transaction helpers --------
 _PAYMENT_STATUS_KEYWORDS = (
     "why my previous transaction got failed",
