@@ -276,6 +276,43 @@ def bootstrap_foods_if_empty():
     except Exception:
         log.exception("bootstrap_foods_if_empty failed")
 
+# ---------------- Generate AI Messages ----------------
+
+def _call_openai_short(prompt: str, max_tokens: int = 80, temperature: float = 0.8) -> str:
+    """Low-latency single message 'writer'. Returns short, human-friendly text."""
+    if client is None:
+        # If OPENAI_API_KEY is missing or client init failed, we can't call LLM.
+        raise RuntimeError("openai client unavailable")
+    r = client.chat.completions.create(
+        model=OPENAI_MODEL or "gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are TomatoAI, a warm, concise food-delivery assistant. "
+                    "Write a single friendly sentence. Avoid long explanations. "
+                    "Sound natural, not robotic."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    return (r.choices[0].message.content or "").strip()
+
+
+def ai_say(prompt: str, fallback: str) -> str:
+    """
+    Try to generate the one-liner with OpenAI; if anything fails, use the fallback string.
+    """
+    try:
+        text = _call_openai_short(prompt)
+        return text if text else fallback
+    except Exception as e:
+        log.error("ai_say() failed: %s", e)
+        return fallback
+
 # ---------------- Utilities ----------------
 def safe_eq(a: str, b: str) -> bool:
     return hmac.compare_digest((a or "").encode(), (b or "").encode())
@@ -1367,7 +1404,11 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             fwd_cookie = request.headers.get(USER_COOKIE_HEADER, "") or ""
 
         if REQUIRE_AUTH_FOR_ORDER and not (jwt_token or fwd_cookie):
-            txt = ("Please log in to your account, then try again from the same browser.")
+            txt = ai_say(
+                "User tried an order/cart action without being signed in. "
+                "Write one short, polite sentence telling them to log in first and try again.",
+                "Please log in to your account, then try again from the same browser."
+            )
             if response is not None:
                 response.headers["X-Answer-Source"] = "order:auth_missing"
                 response.headers["X-Debug-Auth-HasJWT"] = "0"
@@ -1382,7 +1423,12 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             oc = OrderClient(ORDER_API_BASE, jwt=jwt_token, cookie=fwd_cookie)
         except Exception as e:
             log.error("OrderClient init failed: %s", e)
-            return ChatResp(reply="Ordering is temporarily unavailable. Please try again shortly.")
+            msg = ai_say(
+                "The ordering service is temporarily unavailable. "
+                "Write one short, empathetic sentence telling the user to try again shortly.",
+                "Ordering is temporarily unavailable. Please try again shortly."
+            )
+            return ChatResp(reply=msg)
 
         t = action["type"]
         slots = action.get("slots", {})
@@ -1390,7 +1436,13 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
         if t == "prompt_for_items":
             if response is not None:
                 response.headers["X-Answer-Source"] = "order:prompt_items"
-            return ChatResp(reply='Tell me what to add like: “Rice Zucchini x 1, Clover Salad x 2”.')
+            msg = ai_say(
+                "The user said 'add' but we couldn't parse items. "
+                "Write one short, friendly sentence giving an example like "
+                "“Veg Noodles x 1, Greek salad x 2”.",
+                'Tell me what to add like: “Rice Zucchini x 1, Clover Salad x 2”.'
+            )
+            return ChatResp(reply=msg)
 
         if t == "add_multiple":
             added, failed = [], []
@@ -1416,13 +1468,17 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
             choices = ", ".join(slots.get("choices", [])[:5]) or "please share the exact item names"
             if response is not None:
                 response.headers["X-Answer-Source"] = "order:item_disambiguate"
-            return ChatResp(reply=f"Did you mean: {choices}? Tell me the exact names, e.g., “Veg Noodles x 1, Greek salad x 2”.")
-
+            msg = ai_say(
+                f"We couldn't confidently match the user's items. Candidates: {choices}. "
+                "Write one short, friendly sentence: ask them to confirm the exact names with quantities "
+                "like “Veg Noodles x 1, Greek salad x 2”.",
+                f"Did you mean: {choices}? Tell me the exact names, e.g., “Veg Noodles x 1, Greek salad x 2”."
+            )
+            return ChatResp(reply=msg)
         if t == "show_cart":
             try:
                 cart = oc.get_cart(user_id=user_id)
 
-                # 🔧 Be defensive about upstream shape
                 if not isinstance(cart, dict):
                     log.warning("show_cart upstream not dict: %s", type(cart).__name__)
                     cart = {}
@@ -1456,7 +1512,12 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                     if response is not None:
                         response.headers["X-Answer-Source"] = "order:cart_empty"
                         response.headers["X-Cart-Should-Refresh"] = "1"
-                    return ChatResp(reply="Your cart is empty. Say “add Veg Noodles x 1”.")
+                    msg = ai_say(
+                        "Cart is empty. Write one short, upbeat sentence that says the cart is empty and gives a small example: "
+                        "“add Veg Noodles x 1”.",
+                        "Your cart is empty. Say “add Veg Noodles x 1”."
+                    )
+                    return ChatResp(reply=msg)
 
                 # Build a friendly preview
                 parts = []
@@ -1490,22 +1551,27 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                     response.headers["X-Debug-Auth-HasJWT"] = "1" if request.headers.get(USER_JWT_HEADER) or request.headers.get("Authorization") else "0"
                     response.headers["X-Debug-Auth-HasCookie"] = "1" if (request.headers.get(USER_COOKIE_HEADER) or "").strip() else "0"
                 log.exception("get_cart crashed (user_id=%s): %s", user_id, e)
-                msg = "I couldn’t load your cart."
+                fallback = "I couldn’t load your cart."
                 if REQUIRE_AUTH_FOR_ORDER:
-                    msg += " Please make sure you’re signed in and the app forwards your login to chat."
+                    fallback += " Please make sure you’re signed in and the app forwards your login to chat."
+                msg = ai_say(
+                    "We failed to load the cart. If login may be required, politely mention that as a hint. "
+                    "One short sentence only.",
+                    fallback
+                )
                 return ChatResp(reply=msg)
 
         if t == "checkout":
             # Get user cart 
             cart = oc.get_cart(user_id)
             if not cart or not any(qty > 0 for qty in cart.values()):
-                # Let OpenAI craft the response (not a static string)
-                chat_prompt = (
-                    "The customer tried to checkout, but their cart is empty. "
-                    "Politely tell them the cart is empty and to choose some dishes before proceeding."
+                msg = ai_say(
+                    "The customer tried to checkout but the cart is empty. "
+                    "Write one short, warm sentence asking them to add items first.",
+                    "Your cart is empty. Please add some delicious dishes before checking out!"
                 )
-                ai_msg = call_openai(chat_prompt)  # a helper that queries OpenAI (see below)
-                return ChatResp(reply=ai_msg, answer_source="order:cart_empty")
+                # (keep header behavior above as-is if you set it)
+                return ChatResp(reply=msg)
 
             # Proceed to checkout if cart not empty
             addr, contact = extract_address_and_contact_from_mem(user_id)
@@ -1525,15 +1591,38 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                 ui_hint = "Open the Cart at the top-right and click **Checkout** to complete your order."
 
                 if checkout_url:
-                    return ChatResp(reply=f"Secure payment link is ready. {ui_hint}")
-                if client_secret:
-                    return ChatResp(reply=f"Payment is ready in the app. {ui_hint}")
+                    msg = ai_say(
+                        "Checkout session created with an external payment link. "
+                        "Write one short, friendly sentence telling the user the secure link is ready "
+                        "and to open the Cart at the top-right to proceed.",
+                        f"Secure payment link is ready. {ui_hint}",
+                    )
+                    return ChatResp(reply=msg)
 
-                return ChatResp(reply=f"Checkout is prepared. {ui_hint}")
+                if client_secret:
+                    msg = ai_say(
+                        "Payment is ready inside the app (Stripe client_secret available). "
+                        "Write one short, friendly sentence telling the user payment is ready in the app "
+                        "and to open the Cart at the top-right to proceed.",
+                        f"Payment is ready in the app. {ui_hint}",
+                    )
+                    return ChatResp(reply=msg)
+
+                msg = ai_say(
+                    "Checkout is prepared but no explicit link or client secret was returned. "
+                    "Write one short, friendly sentence telling the user checkout is prepared "
+                    "and to open the Cart at the top-right to proceed.",
+                    f"Checkout is prepared. {ui_hint}",
+                )
+                return ChatResp(reply=msg)
 
             except Exception as e:
                 log.error("checkout failed: %s", e)
-                return ChatResp(reply="I couldn’t start checkout. Please verify your address and try again.")
+                msg = ai_say(
+                    "Checkout failed to start. Write one short, empathetic sentence asking the user to verify their address and try again.",
+                    "I couldn’t start checkout. Please verify your address and try again."
+                )
+                return ChatResp(reply=msg)
 
         if t == "confirm_order":
             pid = slots.get("payment_intent_id")
@@ -1550,12 +1639,22 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                 return ChatResp(reply=f"Order confirmed 🎉 ETA {eta}. I’ll keep you posted here.")
             except Exception as e:
                 log.error("confirm failed: %s", e)
-                return ChatResp(reply="I couldn’t confirm that payment. If it succeeded, you’ll see the order in your history shortly.")
+                msg = ai_say(
+                    "Payment confirmation failed. Write one short, reassuring sentence saying we couldn't confirm; "
+                    "if it actually succeeded, it will appear soon in order history.",
+                    "I couldn’t confirm that payment. If it succeeded, you’ll see the order in your history shortly."
+                )
+                return ChatResp(reply=msg)
 
         if t == "prompt_for_remove":
             if response is not None:
                 response.headers["X-Answer-Source"] = "order:prompt_remove"
-            return ChatResp(reply='Tell me what to remove like: “remove Veg Noodles x 1, Clover Salad x 2”.')
+            msg = ai_say(
+                "User wants to remove items but we couldn't parse. "
+                "Write one short sentence giving an example like “remove Veg Noodles x 1, Clover Salad x 2”.",
+                'Tell me what to remove like: “remove Veg Noodles x 1, Clover Salad x 2”.'
+            )
+            return ChatResp(reply=msg)
 
         if t == "remove_multiple":
             try:
