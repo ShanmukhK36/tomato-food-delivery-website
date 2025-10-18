@@ -1496,12 +1496,25 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                 return ChatResp(reply=msg)
 
         if t == "checkout":
+            # Get user cart 
+            cart = oc.get_cart(user_id)
+            if not cart or not any(qty > 0 for qty in cart.values()):
+                # Let OpenAI craft the response (not a static string)
+                chat_prompt = (
+                    "The customer tried to checkout, but their cart is empty. "
+                    "Politely tell them the cart is empty and to choose some dishes before proceeding."
+                )
+                ai_msg = call_openai(chat_prompt)  # a helper that queries OpenAI (see below)
+                return ChatResp(reply=ai_msg, answer_source="order:cart_empty")
+
+            # Proceed to checkout if cart not empty
             addr, contact = extract_address_and_contact_from_mem(user_id)
             method = slots.get("payment_method", "card")
             try:
                 res = oc.checkout(CheckoutPayload(address=addr, contact=contact, method=method))
-                checkout_url = (res.get("session_url") or res.get("checkoutUrl") or res.get("url") or "")
+                checkout_url = res.get("session_url") or res.get("checkoutUrl") or res.get("url") or ""
                 client_secret = res.get("clientSecret") or ""
+
                 if response is not None:
                     response.headers["X-Answer-Source"] = "order:checkout"
                     if checkout_url:
@@ -1509,24 +1522,15 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                     if client_secret:
                         response.headers["X-Client-Secret"] = client_secret
 
-                # Unified UI hint for your site
                 ui_hint = "Open the Cart at the top-right and click **Checkout** to complete your order."
 
                 if checkout_url:
-                    # Stripe Checkout link path
-                    return ChatResp(
-                        reply=f"Secure payment link is ready. {ui_hint}"
-                    )
+                    return ChatResp(reply=f"Secure payment link is ready. {ui_hint}")
                 if client_secret:
-                    # Payment Element / Intent flow
-                    return ChatResp(
-                        reply=f"Payment is ready in the app. {ui_hint}"
-                    )
+                    return ChatResp(reply=f"Payment is ready in the app. {ui_hint}")
 
-                # Fallback text
-                return ChatResp(
-                    reply=f"Checkout is prepared. {ui_hint}"
-                )
+                return ChatResp(reply=f"Checkout is prepared. {ui_hint}")
+
             except Exception as e:
                 log.error("checkout failed: %s", e)
                 return ChatResp(reply="I couldn’t start checkout. Please verify your address and try again.")
