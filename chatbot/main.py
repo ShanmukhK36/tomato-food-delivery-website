@@ -580,10 +580,20 @@ def _items_from_cart_map(cart_map: dict):
         except Exception:
             qty = 0
         if qty <= 0:
-            continue  # <-- skip zeros (removed items)
+            continue  
         name = name_by_id.get(str(k), str(k))
         items.append({"name": name, "qty": qty})
     return items
+
+# === Affirmative detection ===
+AFFIRMATIVE_PATTERNS = (
+    r"^\s*(yes|yep|yeah|yup|ok(ay)?|sure|please|go ahead|do it|sounds good|of course|alright|fine|why not|absolutely|definitely)\s*\.?\s*$",
+)
+
+def is_affirmative(text: str) -> bool:
+    """Return True if the user's message is a short affirmative acknowledgment."""
+    t = text or ""
+    return any(re.search(p, t, flags=re.IGNORECASE) for p in AFFIRMATIVE_PATTERNS)
 
 # -------- Last payment / transaction helpers --------
 _PAYMENT_STATUS_KEYWORDS = (
@@ -1223,6 +1233,10 @@ def extract_action(user_msg: str) -> Optional[dict]:
             return {"type": "disambiguate", "slots": {"choices": []}}
         return {"type": "prompt_for_remove", "slots": {}}
 
+     # AFFIRMATIVE quick-follow (e.g., after "cart is empty — add Veg Noodles?")
+    if is_affirmative(t):
+        return {"type": "affirmative", "slots": {}}
+    
     return None
 
 # ---------------- API Models ----------------
@@ -1560,6 +1574,58 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                     fallback
                 )
                 return ChatResp(reply=msg)
+        
+        if t == "affirmative":
+            try:
+                cart_payload = oc.get_cart(user_id=user_id)
+                # Normalize to list of items
+                current_items = _normalize_cart_items(cart_payload if isinstance(cart_payload, dict) else {})
+                cart_empty = not any(int((it.get("qty") or 0)) > 0 for it in current_items)
+
+                if not cart_empty:
+                    # Cart already has items; let the LLM take the conversation forward
+                    msg = ai_say(
+                        "The customer said 'yes' but their cart isn't empty. "
+                        "Respond with a short, friendly confirmation like 'Got it—what would you like to do next?'",
+                        "Got it — what would you like to do next?"
+                    )
+                    if response is not None:
+                        response.headers["X-Answer-Source"] = "order:affirmative_noop"
+                    return ChatResp(reply=msg)
+
+                # Cart is empty -> add default starter item (Veg Noodles x1)
+                starter_id = default_starter_item_id()
+                if not starter_id:
+                    # If we couldn't locate any starter, nudge the user
+                    msg = ai_say(
+                        "We couldn't find a default starter item to add. "
+                        "Ask the user to name a dish to add, one short sentence.",
+                        "Tell me the dish you’d like to add (e.g., Veg Noodles x 1)."
+                    )
+                    if response is not None:
+                        response.headers["X-Answer-Source"] = "order:affirmative_no_starter"
+                    return ChatResp(reply=msg)
+
+                _ = oc.add_to_cart(AddToCartPayload(item_id=starter_id, qty=1), user_id=user_id)
+
+                # Mark refresh + LLM-confirmation
+                if response is not None:
+                    response.headers["X-Answer-Source"] = "order:add_default"
+                    response.headers["X-Cart-Should-Refresh"] = "1"
+
+                # Friendly, LLM-generated confirmation
+                msg = ai_say(
+                    "We just added Veg Noodles x 1 to the customer's empty cart after they said 'yes'. "
+                    "Write one short, friendly sentence confirming the add and suggesting 'show cart' or 'checkout'.",
+                    "Added Veg Noodles ×1. Say “show cart” or “checkout”."
+                )
+                return ChatResp(reply=msg)
+
+            except Exception as e:
+                log.error("affirmative default add failed: %s", e)
+                if response is not None:
+                    response.headers["X-Answer-Source"] = "order:affirmative_error"
+                return ChatResp(reply="I couldn’t add that just now—please try again with the item name, like “Veg Noodles x 1”.")
 
         if t == "checkout":
             # Get user cart 
