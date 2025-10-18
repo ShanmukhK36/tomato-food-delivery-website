@@ -1508,11 +1508,25 @@ async def chat(req: ChatReq, x_service_auth: str = Header(default=""), request: 
                         response.headers["X-Checkout-Url"] = checkout_url
                     if client_secret:
                         response.headers["X-Client-Secret"] = client_secret
+
+                # Unified UI hint for your site
+                ui_hint = "Open the Cart at the top-right and click **Checkout** to complete your order."
+
                 if checkout_url:
-                    return ChatResp(reply="Secure payment link is ready. Complete payment to place your order.")
+                    # Stripe Checkout link path
+                    return ChatResp(
+                        reply=f"Secure payment link is ready. {ui_hint}"
+                    )
                 if client_secret:
-                    return ChatResp(reply="Payment is ready. I’ll help you finalize it in the app.")
-                return ChatResp(reply="Checkout is prepared. Follow the payment steps to finish.")
+                    # Payment Element / Intent flow
+                    return ChatResp(
+                        reply=f"Payment is ready in the app. {ui_hint}"
+                    )
+
+                # Fallback text
+                return ChatResp(
+                    reply=f"Checkout is prepared. {ui_hint}"
+                )
             except Exception as e:
                 log.error("checkout failed: %s", e)
                 return ChatResp(reply="I couldn’t start checkout. Please verify your address and try again.")
